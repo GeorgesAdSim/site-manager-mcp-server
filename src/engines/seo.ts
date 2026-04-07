@@ -11,6 +11,7 @@
  *   sm_score_global         — Global site score 0-100 aggregating all SEO dimensions
  *   sm_check_rendering      — Compare HTML rendered meta vs DB meta (SSR injection check)
  *   sm_generate_canonical   — Generate and persist canonical URLs + hreflang for a collection
+ *   sm_find_orphan_pages    — Find pages with no inbound internal links
  */
 
 import { z } from 'zod';
@@ -1928,6 +1929,86 @@ Returns:
             hreflangs: r.hreflangs.length > 0 ? r.hreflangs : undefined,
             was_missing: !r.had_canonical,
           })),
+        };
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
+        };
+      });
+    }
+  );
+
+  // ----------------------------------------------------------
+  // sm_find_orphan_pages
+  // ----------------------------------------------------------
+  server.registerTool(
+    'sm_find_orphan_pages',
+    {
+      title: 'Find Orphan Pages',
+      description: `Find pages that have no inbound internal links (orphan pages). Uses the sm_orphan_pages view which cross-references sm_seo_meta with sm_internal_links.
+
+Args:
+  - locale: Locale to check (default "fr")
+  - limit: Max results (default 20)
+
+Returns:
+  - List of orphan pages with page_type, page_id, meta_title, seo_score
+  - Total orphan count and percentage vs total pages`,
+      inputSchema: {
+        locale: z.string().default('fr').describe('Locale to check'),
+        limit: z.number().int().min(1).max(100).default(20).describe('Max results'),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ locale, limit }) => {
+      return withAudit('sm_find_orphan_pages', 'audit', context.getActiveTargetName(), {
+        params: { locale, limit },
+      }, async () => {
+        const client = context.getClient();
+
+        // Query the sm_orphan_pages view
+        const { data: orphans, error: orphanErr } = await client
+          .from('sm_orphan_pages')
+          .select('page_type, page_id, locale, meta_title, seo_score')
+          .eq('locale', locale)
+          .order('seo_score', { ascending: true })
+          .limit(limit);
+
+        if (orphanErr) throw new Error(`Failed to query sm_orphan_pages: ${orphanErr.message}`);
+
+        // Get total count of orphans for this locale
+        const { count: orphanTotal } = await client
+          .from('sm_orphan_pages')
+          .select('*', { count: 'exact', head: true })
+          .eq('locale', locale);
+
+        // Get total pages in sm_seo_meta for this locale
+        const { count: totalPages } = await client
+          .from('sm_seo_meta')
+          .select('*', { count: 'exact', head: true })
+          .eq('locale', locale);
+
+        const orphanCount = orphanTotal || 0;
+        const totalCount = totalPages || 0;
+        const orphanPct = totalCount > 0 ? Math.round((orphanCount / totalCount) * 100) : 0;
+
+        const output = {
+          locale,
+          orphan_count: orphanCount,
+          total_pages: totalCount,
+          orphan_percentage: orphanPct,
+          pages: ((orphans || []) as Record<string, unknown>[]).map(o => ({
+            page_type: o.page_type,
+            page_id: o.page_id,
+            meta_title: o.meta_title || '(no title)',
+            seo_score: o.seo_score,
+          })),
+          recommendation: orphanPct > 50
+            ? 'Critical — more than half your pages are orphans. Run sm_suggest_internal_links to generate link suggestions.'
+            : orphanPct > 20
+              ? 'Warning — significant orphan pages. Consider adding internal links.'
+              : 'Good — most pages have inbound links.',
         };
 
         return {

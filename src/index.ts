@@ -27,7 +27,7 @@ import * as context from './shared/context.js';
 import { registerCoreTools } from './engines/core.js';
 import { registerContentTools } from './engines/content.js';
 import { registerSeoTools } from './engines/seo.js';
-// import { registerPerformanceTools } from './engines/performance.js';
+import { registerPerformanceTools } from './engines/performance.js';
 // import { registerDeployTools } from './engines/deploy.js';
 // import { registerConnectTools } from './engines/connect.js';
 // import { registerI18nTools } from './engines/i18n.js';
@@ -72,7 +72,9 @@ registerContentTools(server);
 
 // SEO engine
 registerSeoTools(server);
-// registerPerformanceTools(server);
+
+// Performance engine
+registerPerformanceTools(server);
 // registerDeployTools(server);
 // registerConnectTools(server);
 // registerI18nTools(server);
