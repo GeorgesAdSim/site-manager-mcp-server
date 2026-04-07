@@ -1,10 +1,12 @@
 /**
- * SEO Engine — Audit, read, and write SEO metadata
+ * SEO Engine — Audit, read, and write SEO metadata + structured data + internal linking
  *
  * Tools:
- *   sm_audit_seo      — Bulk SEO audit on a collection with scoring
- *   sm_get_seo_meta   — Read SEO meta for a document
- *   sm_update_seo_meta — Write/update SEO meta with auto score recalculation
+ *   sm_audit_seo            — Bulk SEO audit on a collection with scoring
+ *   sm_get_seo_meta         — Read SEO meta for a document
+ *   sm_update_seo_meta      — Write/update SEO meta with auto score recalculation
+ *   sm_generate_schema      — Generate JSON-LD Product schema for a document
+ *   sm_suggest_internal_links — Suggest internal links between same-category documents
  */
 
 import { z } from 'zod';
@@ -523,6 +525,431 @@ Returns:
           score,
           checks,
           fields_updated: Object.keys(data),
+        };
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
+        };
+      });
+    }
+  );
+
+  // ----------------------------------------------------------
+  // sm_generate_schema
+  // ----------------------------------------------------------
+  server.registerTool(
+    'sm_generate_schema',
+    {
+      title: 'Generate JSON-LD Schema',
+      description: `Generate a JSON-LD Product schema (schema.org) for a document and optionally store it in sm_schema_org.
+
+Fetches the document (name, description, subtitle, thumbnail_url, slug, category_id), resolves the category name, and builds a compliant Product JSON-LD.
+
+Args:
+  - collection: Collection name (e.g. "machines")
+  - id: Document UUID or slug
+  - locale: Locale (default "fr")
+  - dry_run: If true (default), only returns the JSON-LD without saving
+
+Returns:
+  - The generated JSON-LD object
+  - saved: boolean indicating if it was persisted`,
+      inputSchema: {
+        collection: z.string().min(1).describe('Collection name'),
+        id: z.string().min(1).describe('Document UUID or slug'),
+        locale: z.string().default('fr').describe('Locale'),
+        dry_run: z.boolean().default(true).describe('If true, do not save to sm_schema_org'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ collection, id, locale, dry_run }) => {
+      return withAudit('sm_generate_schema', 'create', context.getActiveTargetName(), {
+        collection,
+        document_slug: id,
+        params: { locale, dry_run },
+      }, async () => {
+        const contract = await context.loadContract();
+        if (!contract) throw new Error('No Content Contract. Run sm_discover first.');
+
+        const config = contract.collections[collection];
+        if (!config) throw new Error(`Collection "${collection}" not found.`);
+
+        const client = context.getClient();
+
+        // 1. Fetch the document
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+        let query = client.from(config.table).select('*');
+        if (isUuid) {
+          query = query.eq('id', id);
+        } else {
+          query = query.eq(config.slug_field, id);
+        }
+
+        const { data: doc, error: docErr } = await query.single();
+        if (docErr || !doc) throw new Error(`Document "${id}" not found in ${collection}.`);
+
+        const machine = doc as Record<string, unknown>;
+        const machineId = machine.id as string;
+
+        // Resolve localized fields (suffix i18n strategy: name_fr, description_fr, etc.)
+        const i18nStrategy = contract.i18n?.strategy || 'column';
+        const defaultLocale = contract.i18n?.default_locale || 'fr';
+        const isDefault = locale === defaultLocale;
+
+        function getLocalizedField(base: string): string | null {
+          if (i18nStrategy === 'suffix' && !isDefault) {
+            const localized = machine[`${base}_${locale}`];
+            if (localized) return String(localized);
+          }
+          // Fallback: base field or base_defaultLocale
+          if (machine[base] != null) return String(machine[base]);
+          if (i18nStrategy === 'suffix') {
+            const fallback = machine[`${base}_${defaultLocale}`];
+            if (fallback) return String(fallback);
+          }
+          return null;
+        }
+
+        const name = getLocalizedField('name') || getLocalizedField('title') || (machine[config.display_field || 'name'] as string) || '';
+        const description = getLocalizedField('description') || getLocalizedField('subtitle') || '';
+        const thumbnailUrl = (machine.thumbnail_url || machine.image_url || machine.og_image || '') as string;
+        const machineSlug = (machine[config.slug_field] || machine.slug || '') as string;
+
+        // Resolve slug for locale if suffix i18n
+        const localizedSlug = (i18nStrategy === 'suffix' && !isDefault
+          ? (machine[`${config.slug_field}_${locale}`] as string) || machineSlug
+          : machineSlug);
+
+        // 2. Fetch category name + slug
+        const categoryId = machine.category_id as string | null;
+        let categoryName = '';
+        let categorySlug = '';
+
+        if (categoryId) {
+          const { data: cat } = await client
+            .from('categories')
+            .select('*')
+            .eq('id', categoryId)
+            .single();
+
+          if (cat) {
+            const catRecord = cat as Record<string, unknown>;
+            categoryName = (catRecord.name || catRecord.title || '') as string;
+            categorySlug = (catRecord.slug || catRecord.url_slug || '') as string;
+
+            // Try localized category name/slug
+            if (i18nStrategy === 'suffix' && !isDefault) {
+              categoryName = (catRecord[`name_${locale}`] as string) || categoryName;
+              categorySlug = (catRecord[`slug_${locale}`] as string) || categorySlug;
+            }
+          }
+        }
+
+        // 3. Build JSON-LD Product
+        const siteUrl = contract.site.url.replace(/\/$/, '');
+        const machineUrl = `${siteUrl}/${locale}/machines/${categorySlug}/${localizedSlug}`;
+
+        const jsonLd: Record<string, unknown> = {
+          '@context': 'https://schema.org',
+          '@type': 'Product',
+          name,
+          description,
+          image: thumbnailUrl || undefined,
+          brand: {
+            '@type': 'Brand',
+            name: 'JAC',
+          },
+          manufacturer: {
+            '@type': 'Organization',
+            name: 'JAC Machines',
+          },
+          category: categoryName || undefined,
+          url: machineUrl,
+        };
+
+        // Remove undefined values
+        for (const key of Object.keys(jsonLd)) {
+          if (jsonLd[key] === undefined || jsonLd[key] === '') {
+            delete jsonLd[key];
+          }
+        }
+
+        // 4. Save if not dry_run
+        let saved = false;
+        if (!dry_run) {
+          // Upsert: check if a Product schema already exists for this page
+          const { data: existing } = await client
+            .from('sm_schema_org')
+            .select('id')
+            .eq('page_type', collection)
+            .eq('page_id', machineId)
+            .eq('locale', locale)
+            .eq('schema_type', 'Product')
+            .single();
+
+          if (existing) {
+            const { error: updateErr } = await client
+              .from('sm_schema_org')
+              .update({ data: jsonLd, validated: false })
+              .eq('id', (existing as Record<string, unknown>).id);
+            if (updateErr) throw new Error(`Failed to update schema: ${updateErr.message}`);
+          } else {
+            const { error: insertErr } = await client
+              .from('sm_schema_org')
+              .insert({
+                page_type: collection,
+                page_id: machineId,
+                locale,
+                schema_type: 'Product',
+                data: jsonLd,
+                validated: false,
+              });
+            if (insertErr) throw new Error(`Failed to insert schema: ${insertErr.message}`);
+          }
+          saved = true;
+        }
+
+        const output = {
+          collection,
+          document_id: machineId,
+          slug: machineSlug,
+          locale,
+          json_ld: jsonLd,
+          saved,
+          dry_run,
+        };
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
+        };
+      });
+    }
+  );
+
+  // ----------------------------------------------------------
+  // sm_suggest_internal_links
+  // ----------------------------------------------------------
+  server.registerTool(
+    'sm_suggest_internal_links',
+    {
+      title: 'Suggest Internal Links',
+      description: `Suggest internal links between documents of the same category for SEO internal linking (maillage interne).
+
+Groups documents by category and suggests links from each document to others in the same category with a relevance_score.
+
+Args:
+  - collection: Collection name (default "machines")
+  - limit: Max documents to process (default 50)
+  - dry_run: If true (default), only returns suggestions without saving
+
+Returns:
+  - total_suggestions: number of link suggestions
+  - groups: suggestions grouped by source machine
+  - batch_id: UUID of the batch (if saved)`,
+      inputSchema: {
+        collection: z.string().default('machines').describe('Collection name'),
+        limit: z.number().int().min(1).max(200).default(50).describe('Max documents to process'),
+        dry_run: z.boolean().default(true).describe('If true, do not save to sm_internal_links'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ collection, limit, dry_run }) => {
+      return withAudit('sm_suggest_internal_links', 'create', context.getActiveTargetName(), {
+        collection,
+        params: { limit, dry_run },
+      }, async () => {
+        const contract = await context.loadContract();
+        if (!contract) throw new Error('No Content Contract. Run sm_discover first.');
+
+        const config = contract.collections[collection];
+        if (!config) throw new Error(`Collection "${collection}" not found.`);
+
+        const client = context.getClient();
+
+        // 1. Fetch all documents with their category
+        const selectFields = `id, ${config.slug_field !== 'id' ? config.slug_field + ', ' : ''}${config.display_field ? config.display_field + ', ' : ''}category_id`;
+
+        const { data: docs, error: docsErr } = await client
+          .from(config.table)
+          .select(selectFields)
+          .order('created_at', { ascending: false })
+          .limit(limit);
+
+        if (docsErr) throw new Error(`Failed to fetch documents: ${docsErr.message}`);
+        if (!docs || docs.length === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ collection, total_suggestions: 0, message: 'No documents found.' }, null, 2) }],
+          };
+        }
+
+        // 2. Fetch all categories for name resolution
+        // Try with parent_id first, fallback without it
+        let categoriesData: Record<string, unknown>[] | null = null;
+        const { data: catWithParent, error: catErr1 } = await client
+          .from('categories')
+          .select('id, name, slug, parent_id');
+        if (catErr1) {
+          // parent_id column might not exist
+          const { data: catWithout } = await client
+            .from('categories')
+            .select('id, name, slug');
+          categoriesData = (catWithout || []) as Record<string, unknown>[];
+        } else {
+          categoriesData = (catWithParent || []) as Record<string, unknown>[];
+        }
+
+        const categoryMap = new Map<string, Record<string, unknown>>();
+        for (const cat of categoriesData) {
+          categoryMap.set(cat.id as string, cat);
+        }
+
+        // 3. Group documents by category_id
+        const byCategory = new Map<string, Record<string, unknown>[]>();
+        for (const doc of docs as unknown as Record<string, unknown>[]) {
+          const catId = doc.category_id as string | null;
+          if (!catId) continue;
+          if (!byCategory.has(catId)) byCategory.set(catId, []);
+          byCategory.get(catId)!.push(doc);
+        }
+
+        // Helper: check if two categories share a parent
+        function shareParent(catA: string, catB: string): boolean {
+          const a = categoryMap.get(catA);
+          const b = categoryMap.get(catB);
+          if (!a || !b) return false;
+          if (a.parent_id && b.parent_id && a.parent_id === b.parent_id) return true;
+          if (a.parent_id === catB || b.parent_id === catA) return true;
+          return false;
+        }
+
+        // 4. Generate suggestions
+        const suggestions: {
+          source_id: string;
+          source_slug: string;
+          source_name: string;
+          target_id: string;
+          target_slug: string;
+          target_name: string;
+          anchor_text: string;
+          relevance_score: number;
+          category: string;
+        }[] = [];
+
+        const batchId = crypto.randomUUID();
+
+        for (const doc of docs as unknown as Record<string, unknown>[]) {
+          const docId = doc.id as string;
+          const docCatId = doc.category_id as string | null;
+          if (!docCatId) continue;
+
+          const docSlug = (config.slug_field !== 'id' ? doc[config.slug_field] : doc.id) as string;
+          const docName = (config.display_field ? doc[config.display_field] : docSlug) as string;
+
+          // Same category links
+          const sameCatDocs = byCategory.get(docCatId) || [];
+          for (const target of sameCatDocs) {
+            if (target.id === docId) continue;
+            const targetSlug = (config.slug_field !== 'id' ? target[config.slug_field] : target.id) as string;
+            const targetName = (config.display_field ? target[config.display_field] : targetSlug) as string;
+            const catRecord = categoryMap.get(docCatId);
+            suggestions.push({
+              source_id: docId,
+              source_slug: docSlug,
+              source_name: docName,
+              target_id: target.id as string,
+              target_slug: targetSlug,
+              target_name: targetName,
+              anchor_text: targetName,
+              relevance_score: 0.8,
+              category: (catRecord?.name as string) || docCatId,
+            });
+          }
+
+          // Sibling category links (parent_id in common)
+          for (const [otherCatId, otherDocs] of byCategory.entries()) {
+            if (otherCatId === docCatId) continue;
+            if (!shareParent(docCatId, otherCatId)) continue;
+
+            for (const target of otherDocs) {
+              const targetSlug = (config.slug_field !== 'id' ? target[config.slug_field] : target.id) as string;
+              const targetName = (config.display_field ? target[config.display_field] : targetSlug) as string;
+              const catRecord = categoryMap.get(otherCatId);
+              suggestions.push({
+                source_id: docId,
+                source_slug: docSlug,
+                source_name: docName,
+                target_id: target.id as string,
+                target_slug: targetSlug,
+                target_name: targetName,
+                anchor_text: targetName,
+                relevance_score: 0.5,
+                category: (catRecord?.name as string) || otherCatId,
+              });
+            }
+          }
+        }
+
+        // 5. Save if not dry_run
+        let saved = false;
+        if (!dry_run && suggestions.length > 0) {
+          const rows = suggestions.map(s => ({
+            source_type: collection,
+            source_id: s.source_id,
+            target_type: collection,
+            target_id: s.target_id,
+            anchor_text: s.anchor_text,
+            relevance_score: s.relevance_score,
+            auto_generated: true,
+            approved: null,
+            batch_id: batchId,
+          }));
+
+          // Insert in batches of 100
+          for (let i = 0; i < rows.length; i += 100) {
+            const batch = rows.slice(i, i + 100);
+            const { error: insertErr } = await client
+              .from('sm_internal_links')
+              .insert(batch);
+            if (insertErr) throw new Error(`Failed to insert links: ${insertErr.message}`);
+          }
+          saved = true;
+        }
+
+        // 6. Group output by source
+        const grouped: Record<string, {
+          source_slug: string;
+          source_name: string;
+          links: { target_slug: string; target_name: string; anchor_text: string; relevance_score: number; category: string }[];
+        }> = {};
+
+        for (const s of suggestions) {
+          if (!grouped[s.source_id]) {
+            grouped[s.source_id] = {
+              source_slug: s.source_slug,
+              source_name: s.source_name,
+              links: [],
+            };
+          }
+          grouped[s.source_id].links.push({
+            target_slug: s.target_slug,
+            target_name: s.target_name,
+            anchor_text: s.anchor_text,
+            relevance_score: s.relevance_score,
+            category: s.category,
+          });
+        }
+
+        const output = {
+          collection,
+          total_documents: docs.length,
+          total_suggestions: suggestions.length,
+          categories_found: byCategory.size,
+          groups: Object.values(grouped),
+          batch_id: !dry_run ? batchId : undefined,
+          saved,
+          dry_run,
         };
 
         return {
