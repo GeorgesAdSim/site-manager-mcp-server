@@ -28,6 +28,7 @@ import { registerCoreTools } from './engines/core.js';
 import { registerContentTools } from './engines/content.js';
 import { registerSeoTools } from './engines/seo.js';
 import { registerPerformanceTools } from './engines/performance.js';
+import { registerIntelligenceTools } from './engines/intelligence.js';
 // import { registerDeployTools } from './engines/deploy.js';
 // import { registerConnectTools } from './engines/connect.js';
 // import { registerI18nTools } from './engines/i18n.js';
@@ -75,6 +76,9 @@ registerSeoTools(server);
 
 // Performance engine
 registerPerformanceTools(server);
+
+// Intelligence engine
+registerIntelligenceTools(server);
 // registerDeployTools(server);
 // registerConnectTools(server);
 // registerI18nTools(server);
