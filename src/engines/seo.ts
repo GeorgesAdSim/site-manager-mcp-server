@@ -7,6 +7,8 @@
  *   sm_update_seo_meta      — Write/update SEO meta with auto score recalculation
  *   sm_generate_schema      — Generate JSON-LD Product schema for a document
  *   sm_suggest_internal_links — Suggest internal links between same-category documents
+ *   sm_auto_fix_seo         — Auto-audit and fix all SEO for a collection in one call
+ *   sm_score_global         — Global site score 0-100 aggregating all SEO dimensions
  */
 
 import { z } from 'zod';
@@ -950,6 +952,563 @@ Returns:
           batch_id: !dry_run ? batchId : undefined,
           saved,
           dry_run,
+        };
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
+        };
+      });
+    }
+  );
+
+  // ----------------------------------------------------------
+  // sm_auto_fix_seo
+  // ----------------------------------------------------------
+  server.registerTool(
+    'sm_auto_fix_seo',
+    {
+      title: 'Auto-Fix SEO',
+      description: `Audit and auto-fix all SEO for a collection in one call. Generates missing meta titles, descriptions, focus keywords, canonicals, and JSON-LD schemas.
+
+Args:
+  - collection: Collection name (default "machines")
+  - locale: Locale (default "fr")
+  - limit: Max documents (default 50)
+  - dry_run: If true (default), shows the plan without applying
+  - confirm: If true, applies all corrections
+
+Returns:
+  - total_documents, documents_fixed, actions by type, score before/after avg`,
+      inputSchema: {
+        collection: z.string().default('machines').describe('Collection name'),
+        locale: z.string().default('fr').describe('Locale'),
+        limit: z.number().int().min(1).max(200).default(50).describe('Max documents'),
+        dry_run: z.boolean().default(true).describe('Show plan without applying'),
+        confirm: z.boolean().default(false).describe('Apply all corrections'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ collection, locale, limit, dry_run, confirm }) => {
+      if (confirm) {
+        const governance = loadGovernanceConfig();
+        enforceGovernance('sm_auto_fix_seo', governance);
+      }
+
+      return withAudit('sm_auto_fix_seo', confirm ? 'update' : 'audit', context.getActiveTargetName(), {
+        collection,
+        params: { locale, limit, dry_run, confirm },
+      }, async () => {
+        const contract = await context.loadContract();
+        if (!contract) throw new Error('No Content Contract. Run sm_discover first.');
+
+        const config = contract.collections[collection];
+        if (!config) throw new Error(`Collection "${collection}" not found.`);
+
+        const client = context.getClient();
+        const i18nStrategy = contract.i18n?.strategy || 'column';
+        const defaultLocale = contract.i18n?.default_locale || 'fr';
+        const isDefault = locale === defaultLocale;
+        const siteUrl = contract.site.url.replace(/\/$/, '');
+
+        // 1. Fetch documents
+        const { data: docs, error: docsErr } = await client
+          .from(config.table)
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(limit);
+
+        if (docsErr) throw new Error(`Failed to fetch documents: ${docsErr.message}`);
+        if (!docs || docs.length === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ collection, locale, total_documents: 0, message: 'No documents found.' }, null, 2) }],
+          };
+        }
+
+        const docRecords = docs as unknown as Record<string, unknown>[];
+        const docIds = docRecords.map(d => d.id as string);
+
+        // 2. Fetch existing SEO meta
+        const { data: existingSeo } = await client
+          .from('sm_seo_meta')
+          .select('*')
+          .eq('page_type', collection)
+          .eq('locale', locale)
+          .in('page_id', docIds);
+
+        const seoByPageId = new Map<string, Record<string, unknown>>();
+        for (const row of (existingSeo || []) as Record<string, unknown>[]) {
+          seoByPageId.set(row.page_id as string, row);
+        }
+
+        // 3. Fetch existing schemas
+        const { data: existingSchemas } = await client
+          .from('sm_schema_org')
+          .select('page_id, schema_type')
+          .eq('page_type', collection)
+          .in('page_id', docIds);
+
+        const schemaSet = new Set<string>();
+        for (const row of (existingSchemas || []) as Record<string, unknown>[]) {
+          schemaSet.add(`${row.page_id}:${row.schema_type}`);
+        }
+
+        // 4. Fetch categories
+        let categoriesData: Record<string, unknown>[] = [];
+        const { data: catData, error: catErr } = await client
+          .from('categories')
+          .select('id, name, slug');
+        if (!catErr && catData) {
+          categoriesData = catData as Record<string, unknown>[];
+        }
+        const categoryMap = new Map<string, Record<string, unknown>>();
+        for (const cat of categoriesData) {
+          categoryMap.set(cat.id as string, cat);
+        }
+
+        // Helper: get localized field
+        function getLocalized(machine: Record<string, unknown>, base: string): string | null {
+          if (i18nStrategy === 'suffix' && !isDefault) {
+            const localized = machine[`${base}_${locale}`];
+            if (localized) return String(localized);
+          }
+          if (machine[base] != null) return String(machine[base]);
+          if (i18nStrategy === 'suffix') {
+            const fallback = machine[`${base}_${defaultLocale}`];
+            if (fallback) return String(fallback);
+          }
+          return null;
+        }
+
+        // 5. Build fix plan for each document
+        const actions: {
+          document_id: string;
+          slug: string;
+          name: string;
+          fixes: { field: string; action: string; value: string }[];
+          score_before: number;
+          score_after: number;
+        }[] = [];
+
+        const actionCounts: Record<string, number> = {};
+        const scoresBefore: number[] = [];
+        const scoresAfter: number[] = [];
+
+        // Bulk data for upserts
+        const seoUpserts: Record<string, unknown>[] = [];
+        const schemaInserts: Record<string, unknown>[] = [];
+
+        for (const machine of docRecords) {
+          const docId = machine.id as string;
+          const existing = seoByPageId.get(docId);
+          const machineSlug = (machine[config.slug_field] || machine.slug || '') as string;
+          const machineName = getLocalized(machine, 'name') || getLocalized(machine, 'title') ||
+            (config.display_field ? machine[config.display_field] as string : machineSlug) || '';
+          const machineSubtitle = getLocalized(machine, 'subtitle') || '';
+          const machineDesc = getLocalized(machine, 'description') || '';
+          const categoryId = machine.category_id as string | null;
+          const cat = categoryId ? categoryMap.get(categoryId) : null;
+          const catName = cat ? (cat.name as string) : '';
+          const catSlug = cat ? ((i18nStrategy === 'suffix' && !isDefault
+            ? (cat[`slug_${locale}`] as string) || (cat.slug as string)
+            : (cat.slug as string)) || '') : '';
+          const localizedSlug = (i18nStrategy === 'suffix' && !isDefault
+            ? (machine[`${config.slug_field}_${locale}`] as string) || machineSlug
+            : machineSlug);
+
+          const fixes: { field: string; action: string; value: string }[] = [];
+
+          // Current SEO values
+          let metaTitle = (existing?.meta_title as string | null) || null;
+          let metaDesc = (existing?.meta_description as string | null) || null;
+          let focusKeyword = (existing?.focus_keyword as string | null) || null;
+          let canonical = (existing?.canonical as string | null) || null;
+
+          // Score before
+          const { score: scoreBefore } = computeSeoScore({ meta_title: metaTitle, meta_description: metaDesc, focus_keyword: focusKeyword });
+          scoresBefore.push(scoreBefore);
+
+          // a. Meta title missing
+          if (!metaTitle?.trim()) {
+            const suffix = machineSubtitle || catName;
+            let generated = suffix ? `${machineName} | ${suffix} | JAC` : `${machineName} | JAC`;
+            if (generated.length > 58) {
+              generated = `${machineName} | JAC`;
+            }
+            if (generated.length > 58) {
+              generated = generated.substring(0, 55) + '...';
+            }
+            metaTitle = generated;
+            fixes.push({ field: 'meta_title', action: 'generated', value: generated });
+            actionCounts['meta_title_generated'] = (actionCounts['meta_title_generated'] || 0) + 1;
+          }
+
+          // b. Meta description missing
+          if (!metaDesc?.trim()) {
+            let generated = machineDesc.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+            if (generated.length > 155) {
+              generated = generated.substring(0, 152) + '...';
+            } else if (generated.length < 130 && machineSubtitle) {
+              generated = `${machineSubtitle}. ${generated}`;
+              if (generated.length > 155) {
+                generated = generated.substring(0, 152) + '...';
+              }
+            }
+            if (generated.length < 10) {
+              generated = `${machineName} — ${catName || collection}. Découvrez cette machine professionnelle JAC.`;
+            }
+            metaDesc = generated;
+            fixes.push({ field: 'meta_description', action: 'generated', value: generated });
+            actionCounts['meta_description_generated'] = (actionCounts['meta_description_generated'] || 0) + 1;
+          }
+
+          // c. Focus keyword missing
+          if (!focusKeyword?.trim()) {
+            focusKeyword = machineName;
+            fixes.push({ field: 'focus_keyword', action: 'generated', value: machineName });
+            actionCounts['focus_keyword_generated'] = (actionCounts['focus_keyword_generated'] || 0) + 1;
+          }
+
+          // d. Canonical missing
+          if (!canonical?.trim()) {
+            const generatedUrl = `${siteUrl}/${locale}/machines/${catSlug}/${localizedSlug}`;
+            canonical = generatedUrl;
+            fixes.push({ field: 'canonical', action: 'generated', value: generatedUrl });
+            actionCounts['canonical_generated'] = (actionCounts['canonical_generated'] || 0) + 1;
+          }
+
+          // e. Schema JSON-LD missing
+          const hasSchema = schemaSet.has(`${docId}:Product`);
+          if (!hasSchema) {
+            const thumbnailUrl = (machine.thumbnail_url || machine.image_url || '') as string;
+            const jsonLd = {
+              '@context': 'https://schema.org',
+              '@type': 'Product',
+              name: machineName,
+              description: metaDesc,
+              ...(thumbnailUrl ? { image: thumbnailUrl } : {}),
+              brand: { '@type': 'Brand', name: 'JAC' },
+              manufacturer: { '@type': 'Organization', name: 'JAC Machines' },
+              ...(catName ? { category: catName } : {}),
+              url: canonical,
+            };
+            fixes.push({ field: 'schema_product', action: 'generated', value: `JSON-LD Product for ${machineName}` });
+            actionCounts['schema_generated'] = (actionCounts['schema_generated'] || 0) + 1;
+
+            if (confirm && !dry_run) {
+              schemaInserts.push({
+                page_type: collection,
+                page_id: docId,
+                locale,
+                schema_type: 'Product',
+                data: jsonLd,
+                validated: false,
+              });
+            }
+          }
+
+          // Score after
+          const { score: scoreAfter } = computeSeoScore({ meta_title: metaTitle, meta_description: metaDesc, focus_keyword: focusKeyword });
+          scoresAfter.push(scoreAfter);
+
+          if (fixes.length > 0) {
+            actions.push({
+              document_id: docId,
+              slug: machineSlug,
+              name: machineName,
+              fixes,
+              score_before: scoreBefore,
+              score_after: scoreAfter,
+            });
+
+            // Prepare upsert data
+            if (confirm && !dry_run) {
+              const scoreDetails: Record<string, number> = {};
+              const { checks } = computeSeoScore({ meta_title: metaTitle, meta_description: metaDesc, focus_keyword: focusKeyword });
+              for (const check of checks) {
+                scoreDetails[check.name] = check.penalty;
+              }
+
+              seoUpserts.push({
+                docId,
+                existing,
+                data: {
+                  meta_title: metaTitle,
+                  meta_description: metaDesc,
+                  focus_keyword: focusKeyword,
+                  canonical,
+                  seo_score: scoreAfter,
+                  score_details: scoreDetails,
+                  last_audit: new Date().toISOString(),
+                },
+              });
+            }
+          }
+        }
+
+        // 6. Apply corrections if confirm=true and dry_run=false
+        let applied = false;
+        if (confirm && !dry_run && (seoUpserts.length > 0 || schemaInserts.length > 0)) {
+          // Upsert SEO meta
+          for (const item of seoUpserts as { docId: string; existing: Record<string, unknown> | undefined; data: Record<string, unknown> }[]) {
+            if (item.existing) {
+              await client
+                .from('sm_seo_meta')
+                .update(item.data)
+                .eq('id', item.existing.id);
+            } else {
+              await client
+                .from('sm_seo_meta')
+                .insert({
+                  page_type: collection,
+                  page_id: item.docId,
+                  locale,
+                  og_title: null,
+                  og_description: null,
+                  og_image: null,
+                  noindex: false,
+                  nofollow: false,
+                  ...item.data,
+                });
+            }
+          }
+
+          // Insert schemas in batches
+          if (schemaInserts.length > 0) {
+            for (let i = 0; i < schemaInserts.length; i += 50) {
+              const batch = schemaInserts.slice(i, i + 50);
+              await client.from('sm_schema_org').insert(batch);
+            }
+          }
+
+          applied = true;
+        }
+
+        // 7. Build output
+        const avgBefore = scoresBefore.length > 0 ? Math.round(scoresBefore.reduce((a, b) => a + b, 0) / scoresBefore.length) : 0;
+        const avgAfter = scoresAfter.length > 0 ? Math.round(scoresAfter.reduce((a, b) => a + b, 0) / scoresAfter.length) : 0;
+
+        const output = {
+          collection,
+          locale,
+          total_documents: docRecords.length,
+          documents_fixed: actions.length,
+          documents_already_ok: docRecords.length - actions.length,
+          actions_taken: actionCounts,
+          score_before_avg: avgBefore,
+          score_after_avg: avgAfter,
+          score_improvement: avgAfter - avgBefore,
+          applied,
+          dry_run,
+          confirm,
+          plan: actions.map(a => ({
+            slug: a.slug,
+            name: a.name,
+            score: `${a.score_before} → ${a.score_after}`,
+            fixes: a.fixes.map(f => `${f.field}: ${f.action}`),
+          })),
+        };
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
+        };
+      });
+    }
+  );
+
+  // ----------------------------------------------------------
+  // sm_score_global
+  // ----------------------------------------------------------
+  server.registerTool(
+    'sm_score_global',
+    {
+      title: 'Global Site Score',
+      description: `Calculate a single 0-100 score for the entire site, aggregating all SEO dimensions.
+
+Dimensions:
+  - SEO Score (40%): average seo_score from sm_seo_meta
+  - Schema Coverage (20%): % of documents with JSON-LD in sm_schema_org
+  - Internal Links Health (15%): % of pages with approved internal links
+  - Orphan Pages Penalty (10%): % of pages with no inbound links
+  - Meta Completeness (15%): % of documents with both meta_title and meta_description
+
+Args:
+  - locale: Locale to evaluate (default "fr")
+
+Returns:
+  - Global score, per-dimension breakdown, top 5 pages to improve, trend vs last audit`,
+      inputSchema: {
+        locale: z.string().default('fr').describe('Locale to evaluate'),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ locale }) => {
+      return withAudit('sm_score_global', 'audit', context.getActiveTargetName(), {
+        params: { locale },
+      }, async () => {
+        const contract = await context.loadContract();
+        if (!contract) throw new Error('No Content Contract. Run sm_discover first.');
+
+        const client = context.getClient();
+
+        // Count total documents across all collections
+        let totalDocuments = 0;
+        const collectionCounts: Record<string, number> = {};
+        for (const [name, config] of Object.entries(contract.collections)) {
+          const { count } = await client
+            .from(config.table)
+            .select('*', { count: 'exact', head: true });
+          const c = count || 0;
+          collectionCounts[name] = c;
+          totalDocuments += c;
+        }
+
+        if (totalDocuments === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ score: 0, message: 'No documents found in any collection.' }, null, 2) }],
+          };
+        }
+
+        // 1. SEO Score (40%) — average seo_score
+        const { data: seoData } = await client
+          .from('sm_seo_meta')
+          .select('page_id, page_type, seo_score, meta_title, meta_description')
+          .eq('locale', locale);
+
+        const seoRecords = (seoData || []) as Record<string, unknown>[];
+        const seoScores = seoRecords.map(r => r.seo_score as number);
+        const seoAvg = seoScores.length > 0
+          ? seoScores.reduce((a, b) => a + b, 0) / seoScores.length
+          : 0;
+
+        // 2. Schema Coverage (20%) — % of documents with at least one schema
+        const { data: schemaData } = await client
+          .from('sm_schema_org')
+          .select('page_id');
+
+        const uniqueSchemaPages = new Set((schemaData || []).map((r: Record<string, unknown>) => r.page_id));
+        const schemaPct = totalDocuments > 0
+          ? (uniqueSchemaPages.size / totalDocuments) * 100
+          : 0;
+
+        // 3. Internal Links Health (15%) — % of pages with approved outbound links
+        const { data: linksData } = await client
+          .from('sm_internal_links')
+          .select('source_id')
+          .eq('approved', true);
+
+        const uniqueLinkedPages = new Set((linksData || []).map((r: Record<string, unknown>) => r.source_id));
+        const linksPct = totalDocuments > 0
+          ? (uniqueLinkedPages.size / totalDocuments) * 100
+          : 0;
+
+        // 4. Orphan Pages Penalty (10%) — % of pages with no inbound links
+        // Try the view first, fallback to manual check
+        let orphanPct = 0;
+        const { data: inboundData } = await client
+          .from('sm_internal_links')
+          .select('target_id')
+          .eq('approved', true);
+
+        const pagesWithInbound = new Set((inboundData || []).map((r: Record<string, unknown>) => r.target_id));
+        // Documents without inbound = orphans
+        const pagesWithSeo = new Set(seoRecords.map(r => r.page_id as string));
+        const allTrackedPages = new Set([...pagesWithSeo, ...uniqueSchemaPages, ...uniqueLinkedPages]);
+        const orphanCount = [...allTrackedPages].filter(p => !pagesWithInbound.has(p)).length;
+        orphanPct = allTrackedPages.size > 0
+          ? (orphanCount / allTrackedPages.size) * 100
+          : 100;
+
+        // 5. Meta Completeness (15%) — % with both meta_title AND meta_description
+        const completeMeta = seoRecords.filter(r =>
+          (r.meta_title as string | null)?.trim() && (r.meta_description as string | null)?.trim()
+        ).length;
+        const metaPct = totalDocuments > 0
+          ? (completeMeta / totalDocuments) * 100
+          : 0;
+
+        // Calculate global score
+        const globalScore = Math.round(
+          (seoAvg * 0.4) +
+          (schemaPct * 0.2) +
+          (linksPct * 0.15) +
+          ((100 - orphanPct) * 0.1) +
+          (metaPct * 0.15)
+        );
+
+        // Top 5 pages to improve (lowest SEO scores)
+        const sortedByScore = [...seoRecords]
+          .sort((a, b) => (a.seo_score as number) - (b.seo_score as number))
+          .slice(0, 5);
+
+        // Trend vs last audit — check sm_seo_history for latest entry
+        let trend: { previous_avg: number; delta: number } | null = null;
+        try {
+          const { data: historyData } = await client
+            .from('sm_seo_history')
+            .select('avg_score, audited_at')
+            .eq('locale', locale)
+            .order('audited_at', { ascending: false })
+            .limit(1);
+
+          if (historyData && historyData.length > 0) {
+            const prev = (historyData[0] as Record<string, unknown>).avg_score as number;
+            trend = {
+              previous_avg: prev,
+              delta: Math.round(seoAvg - prev),
+            };
+          }
+        } catch {
+          // sm_seo_history might not exist
+        }
+
+        const output = {
+          score: globalScore,
+          locale,
+          total_documents: totalDocuments,
+          dimensions: {
+            seo_score: {
+              weight: '40%',
+              value: Math.round(seoAvg),
+              documents_with_meta: seoRecords.length,
+              contribution: Math.round(seoAvg * 0.4),
+            },
+            schema_coverage: {
+              weight: '20%',
+              value: Math.round(schemaPct),
+              documents_with_schema: uniqueSchemaPages.size,
+              contribution: Math.round(schemaPct * 0.2),
+            },
+            internal_links_health: {
+              weight: '15%',
+              value: Math.round(linksPct),
+              pages_with_links: uniqueLinkedPages.size,
+              contribution: Math.round(linksPct * 0.15),
+            },
+            orphan_pages: {
+              weight: '10%',
+              value: Math.round(orphanPct),
+              orphan_count: orphanCount,
+              tracked_pages: allTrackedPages.size,
+              contribution: Math.round((100 - orphanPct) * 0.1),
+            },
+            meta_completeness: {
+              weight: '15%',
+              value: Math.round(metaPct),
+              complete_count: completeMeta,
+              contribution: Math.round(metaPct * 0.15),
+            },
+          },
+          top_5_to_improve: sortedByScore.map(r => ({
+            page_id: r.page_id,
+            page_type: r.page_type,
+            seo_score: r.seo_score,
+            has_title: !!(r.meta_title as string | null)?.trim(),
+            has_description: !!(r.meta_description as string | null)?.trim(),
+          })),
+          trend,
+          collections: collectionCounts,
         };
 
         return {
