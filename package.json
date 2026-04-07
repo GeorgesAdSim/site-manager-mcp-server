@@ -1,0 +1,67 @@
+{
+  "name": "@adsim/site-manager-mcp-server",
+  "version": "0.1.0",
+  "description": "The AI-native site manager — content, SEO, performance, deploy — from a conversation. No CMS needed.",
+  "author": "AdSim SRL <info@adsim.be>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GeorgesAdSim/site-manager-mcp-server.git"
+  },
+  "homepage": "https://github.com/GeorgesAdSim/site-manager-mcp-server#readme",
+  "keywords": [
+    "mcp",
+    "site-manager",
+    "cms",
+    "seo",
+    "ai-native",
+    "supabase",
+    "claude",
+    "bolt.new",
+    "lovable",
+    "vibe-coding",
+    "content-management",
+    "headless",
+    "react",
+    "vite",
+    "netlify"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "site-manager-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "companion",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "start:http": "MCP_TRANSPORT=http node dist/index.js",
+    "test": "vitest",
+    "test:watch": "vitest --watch",
+    "test:coverage": "vitest --coverage",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@supabase/supabase-js": "^2.49.0",
+    "express": "^4.21.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
