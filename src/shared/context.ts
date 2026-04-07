@@ -71,7 +71,12 @@ export function setTarget(name: string): void {
   }
 
   activeTarget = name;
-  activeClient = createClient(config.supabase_url, config.supabase_service_key);
+  activeClient = createClient(config.supabase_url, config.supabase_service_key, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
   activeContract = null; // Will be lazy-loaded
 
   process.stderr.write(`[sm] Target set: ${name} → ${config.supabase_url}\n`);

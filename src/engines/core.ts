@@ -160,10 +160,15 @@ Returns:
       }, async () => {
         const client = context.getClient();
 
-        // 1. Introspect all tables
+        // 1. Discover tables via exec_sql RPC or probe-based fallback
+        const tables: TableInfo[] = [];
+        const smTables: string[] = [];
+        let tableRows: Record<string, number> = {};
+
+        // Try exec_sql RPC first
         const { data: tablesData, error: tablesError } = await client.rpc('exec_sql', {
           query: `
-            SELECT 
+            SELECT
               t.table_name,
               (SELECT reltuples::bigint FROM pg_class WHERE relname = t.table_name) as approx_rows
             FROM information_schema.tables t
@@ -173,30 +178,6 @@ Returns:
           `
         });
 
-        // Fallback if exec_sql not available
-        let tableNames: string[] = [];
-        let tableRows: Record<string, number> = {};
-
-        if (tablesError) {
-          // Use information_schema directly
-          const { data } = await client
-            .from('information_schema.tables' as unknown as string)
-            .select('table_name')
-            .eq('table_schema', 'public')
-            .eq('table_type', 'BASE TABLE');
-          tableNames = ((data || []) as unknown as { table_name: string }[]).map(t => t.table_name);
-        } else if (tablesData) {
-          const rows = typeof tablesData === 'string' ? JSON.parse(tablesData) : tablesData;
-          for (const row of rows) {
-            tableNames.push(row.table_name);
-            tableRows[row.table_name] = row.approx_rows || 0;
-          }
-        }
-
-        // 2. Get columns for each table
-        const tables: TableInfo[] = [];
-        const smTables: string[] = [];
-        const skipPrefixes = ['sm_', 'auth.', '_', 'pg_', 'supabase_'];
         const systemTables = new Set([
           'schema_migrations', 'extensions', 'buckets', 'objects',
           'secrets', 'hooks', 'mfa_factors', 'sessions',
@@ -205,60 +186,176 @@ Returns:
           'audit_log_entries', 'identities', 'one_time_tokens',
         ]);
 
-        for (const tableName of tableNames) {
-          // Track sm_ tables separately
-          if (tableName.startsWith('sm_')) {
-            smTables.push(tableName);
-            continue;
+        if (!tablesError && tablesData) {
+          // exec_sql available — use schema introspection
+          const rows = typeof tablesData === 'string' ? JSON.parse(tablesData) : tablesData;
+          for (const row of rows) {
+            tableRows[row.table_name] = row.approx_rows || 0;
           }
 
-          // Skip system tables
-          if (systemTables.has(tableName)) continue;
-          if (skipPrefixes.some(p => tableName.startsWith(p))) continue;
+          for (const row of rows) {
+            const tableName = row.table_name;
+            if (tableName.startsWith('sm_')) { smTables.push(tableName); continue; }
+            if (systemTables.has(tableName)) continue;
+            if (['auth.', '_', 'pg_', 'supabase_'].some(p => tableName.startsWith(p))) continue;
 
-          // Get column info
-          const { data: colData } = await client.rpc('exec_sql', {
-            query: `
-              SELECT column_name, data_type, is_nullable, column_default
-              FROM information_schema.columns
-              WHERE table_schema = 'public' AND table_name = '${tableName}'
-              ORDER BY ordinal_position
-            `
-          });
+            const { data: colData } = await client.rpc('exec_sql', {
+              query: `
+                SELECT column_name, data_type, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = '${tableName}'
+                ORDER BY ordinal_position
+              `
+            });
 
-          let columns: ColumnInfo[] = [];
-          if (colData) {
-            const cols = typeof colData === 'string' ? JSON.parse(colData) : colData;
-            columns = cols.map((c: Record<string, string>) => ({
-              name: c.column_name,
-              type: c.data_type,
-              nullable: c.is_nullable === 'YES',
-              default_value: c.column_default,
-            }));
+            let columns: ColumnInfo[] = [];
+            if (colData) {
+              const cols = typeof colData === 'string' ? JSON.parse(colData) : colData;
+              columns = cols.map((c: Record<string, string>) => ({
+                name: c.column_name,
+                type: c.data_type,
+                nullable: c.is_nullable === 'YES',
+                default_value: c.column_default,
+              }));
+            }
+
+            const hasLocaleColumn = columns.some(c =>
+              c.name === 'locale' || c.name === 'language' || c.name === 'lang' || c.name === 'language_code'
+            );
+            const hasForeignKey = columns.some(c => c.name.endsWith('_id') && c.name !== 'id');
+
+            tables.push({
+              name: tableName,
+              row_count: tableRows[tableName] || 0,
+              columns,
+              has_translations: hasLocaleColumn && hasForeignKey,
+            });
           }
+        } else {
+          // Fallback: probe tables by sample query (no exec_sql needed)
+          // Probe a broad candidate list via Supabase PostgREST API
+          const candidates = [
+            // Common content tables
+            'machines', 'products', 'categories', 'product_categories',
+            'pages', 'posts', 'articles', 'blog_posts', 'sections',
+            'media', 'media_items', 'files', 'images',
+            'specifications', 'glossary', 'testimonials', 'brands',
+            'page_configs', 'navigation', 'menus', 'settings', 'config',
+            'tags', 'contacts', 'form_submissions', 'profiles', 'user_roles',
+            // Translation tables
+            'product_translations', 'machine_translations', 'page_translations',
+            'category_translations', 'translations',
+            // Views
+            'machines_with_categories', 'machines_with_media',
+            'machines_with_specs', 'machines_with_translations',
+            'document_embeddings', 'media_statistics', 'video_stats',
+            // SM tables
+            'sm_globals', 'sm_seo_meta', 'sm_schema_org', 'sm_internal_links',
+            'sm_audit_log', 'sm_changelog', 'sm_media', 'sm_redirects',
+          ];
 
-          // Detect if this is a translation table
-          const hasLocaleColumn = columns.some(c => 
-            c.name === 'locale' || c.name === 'language' || c.name === 'lang' || c.name === 'language_code'
+          const probeResults = await Promise.all(
+            candidates.map(async (name) => {
+              const { count, error: probeErr } = await client
+                .from(name)
+                .select('*', { count: 'exact', head: true });
+              if (probeErr) return null;
+
+              // Get a sample row for column discovery
+              const { data: rows } = await client.from(name).select('*').limit(1);
+              const sample = rows && rows.length > 0 ? rows[0] as Record<string, unknown> : null;
+              return { name, count: count ?? 0, sample };
+            })
           );
-          const hasForeignKey = columns.some(c => c.name.endsWith('_id') && !c.name.startsWith('id'));
 
-          tables.push({
-            name: tableName,
-            row_count: tableRows[tableName] || 0,
-            columns,
-            has_translations: hasLocaleColumn && hasForeignKey,
-          });
+          for (const result of probeResults) {
+            if (!result) continue;
+            const { name, count, sample } = result;
+
+            if (name.startsWith('sm_')) { smTables.push(name); continue; }
+            if (systemTables.has(name)) continue;
+
+            // Build columns from sample row keys
+            const columns: ColumnInfo[] = sample
+              ? Object.keys(sample).map(key => ({
+                  name: key,
+                  type: inferType(sample[key]),
+                  nullable: sample[key] === null,
+                  default_value: null,
+                }))
+              : [];
+
+            const hasLocaleColumn = columns.some(c =>
+              c.name === 'locale' || c.name === 'language' || c.name === 'lang' || c.name === 'language_code'
+            );
+            const hasForeignKey = columns.some(c => c.name.endsWith('_id') && c.name !== 'id');
+
+            tableRows[name] = count;
+            tables.push({
+              name,
+              row_count: count,
+              columns,
+              has_translations: hasLocaleColumn && hasForeignKey,
+            });
+          }
         }
 
-        // 3. Detect collections vs translation tables
+        // 3. Detect i18n strategy: translation_table vs suffix
+        //    Suffix pattern: columns like name_en, name_de, slug_fr, description_it
+        const KNOWN_LOCALES = new Set([
+          'fr', 'en', 'en_us', 'de', 'es', 'it', 'nl', 'ru', 'pl', 'pt',
+          'ja', 'zh', 'ko', 'ar', 'tr', 'sv', 'da', 'fi', 'no', 'cs',
+          'hu', 'ro', 'bg', 'hr', 'sk', 'sl', 'el', 'uk', 'he', 'th',
+        ]);
+
         const translationTables = tables.filter(t => t.has_translations);
         const translationTableNames = new Set(translationTables.map(t => t.name));
 
+        // Detect suffix-based i18n by scanning column names
+        const suffixLocalesSet = new Set<string>();
+        for (const table of tables) {
+          for (const col of table.columns) {
+            const match = col.name.match(/^(?:name|title|description|subtitle|slug|label|content|meta_title|meta_description)_([a-z]{2}(?:_[a-z]{2,3})?)$/);
+            if (match && KNOWN_LOCALES.has(match[1])) {
+              suffixLocalesSet.add(match[1]);
+            }
+          }
+        }
+        const suffixLocales = [...suffixLocalesSet].sort();
+        const hasSuffixI18n = suffixLocales.length > 0;
+
+        // Determine i18n strategy
+        let i18nStrategy: 'translation_table' | 'suffix' | 'column' = 'column';
+        let detectedLocales: string[] = ['fr'];
+
+        if (hasSuffixI18n) {
+          i18nStrategy = 'suffix';
+          // Add default locale (fr) if not in suffixes — it's the base column
+          detectedLocales = suffixLocales.includes('fr') ? suffixLocales : ['fr', ...suffixLocales];
+        } else if (translationTables.length > 0) {
+          i18nStrategy = 'translation_table';
+          const localeCol = translationTables[0].columns.find(c =>
+            c.name === 'locale' || c.name === 'language' || c.name === 'lang'
+          );
+          if (localeCol) {
+            const { data: localeData } = await client
+              .from(translationTables[0].name)
+              .select(localeCol.name)
+              .limit(100);
+            if (localeData) {
+              const locales = [...new Set((localeData as unknown as Record<string, string>[]).map(d => d[localeCol.name]))];
+              if (locales.length > 0) detectedLocales = locales as string[];
+            }
+          }
+        }
+
+        const i18nDetected = hasSuffixI18n || translationTables.length > 0;
+
+        // 4. Build suggested collections
         const suggestedCollections: SuggestedCollection[] = [];
         for (const table of tables) {
-          if (translationTableNames.has(table.name)) continue; // Skip translation tables
-          
+          if (translationTableNames.has(table.name)) continue;
+
           // Find matching translation table
           const possibleTranslationNames = [
             `${table.name}_translations`,
@@ -266,12 +363,12 @@ Returns:
             `${table.name}_i18n`,
             `${table.name}_locales`,
           ];
-          const translationTable = translationTables.find(t => 
+          const translationTable = translationTables.find(t =>
             possibleTranslationNames.includes(t.name)
           );
 
           // Detect slug field
-          const slugField = table.columns.find(c => 
+          const slugField = table.columns.find(c =>
             c.name === 'slug' || c.name === 'url_slug' || c.name === 'permalink'
           );
 
@@ -289,25 +386,6 @@ Returns:
             field_count: table.columns.length,
             row_count: tableRows[table.name] || 0,
           });
-        }
-
-        // 4. Detect i18n
-        const i18nDetected = translationTables.length > 0;
-        let detectedLocales: string[] = ['fr'];
-        if (i18nDetected && translationTables.length > 0) {
-          const localeCol = translationTables[0].columns.find(c => 
-            c.name === 'locale' || c.name === 'language' || c.name === 'lang'
-          );
-          if (localeCol) {
-            const { data: localeData } = await client
-              .from(translationTables[0].name)
-              .select(localeCol.name)
-              .limit(100);
-            if (localeData) {
-              const locales = [...new Set((localeData as unknown as Record<string, string>[]).map(d => d[localeCol.name]))];
-              if (locales.length > 0) detectedLocales = locales as string[];
-            }
-          }
         }
 
         // 5. Generate Content Contract
@@ -358,9 +436,9 @@ Returns:
           },
           i18n: {
             enabled: i18nDetected,
-            default_locale: detectedLocales[0] || 'fr',
+            default_locale: detectedLocales.includes('fr') ? 'fr' : detectedLocales[0] || 'fr',
             locales: detectedLocales,
-            strategy: i18nDetected ? 'translation_table' : 'column',
+            strategy: i18nStrategy,
             seo_sync: true,
           },
           seo: {
@@ -376,13 +454,31 @@ Returns:
           if (!table) continue;
 
           const fields: Record<string, FieldConfig> = {};
+          // Detect which base fields have suffix translations
+          const baseFieldsWithSuffix = new Set<string>();
+          if (i18nStrategy === 'suffix') {
+            for (const col of table.columns) {
+              const match = col.name.match(/^(.+?)_([a-z]{2}(?:_[a-z]{2,3})?)$/);
+              if (match && KNOWN_LOCALES.has(match[2])) {
+                baseFieldsWithSuffix.add(match[1]);
+              }
+            }
+          }
+
           for (const col of table.columns) {
             if (['id', 'created_at', 'updated_at'].includes(col.name)) continue;
+            // Skip suffix columns (name_en, slug_fr, etc.) — they are handled via the base field's translatable flag
+            if (i18nStrategy === 'suffix') {
+              const suffixMatch = col.name.match(/^(.+?)_([a-z]{2}(?:_[a-z]{2,3})?)$/);
+              if (suffixMatch && KNOWN_LOCALES.has(suffixMatch[2]) && baseFieldsWithSuffix.has(suffixMatch[1])) {
+                continue;
+              }
+            }
 
             fields[col.name] = {
               type: mapPostgresType(col.type) as FieldConfig['type'],
               required: !col.nullable && !col.default_value,
-              translatable: false,
+              translatable: baseFieldsWithSuffix.has(col.name),
               description: col.name.replace(/_/g, ' '),
             };
           }
@@ -577,4 +673,21 @@ function mapPostgresType(pgType: string): string {
     'USER-DEFINED': 'string',
   };
   return mapping[pgType] || 'string';
+}
+
+/**
+ * Infer a Postgres-like type name from a JS runtime value (used in probe fallback)
+ */
+function inferType(value: unknown): string {
+  if (value === null || value === undefined) return 'text';
+  if (typeof value === 'boolean') return 'boolean';
+  if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'numeric';
+  if (Array.isArray(value)) return 'ARRAY';
+  if (typeof value === 'object') return 'jsonb';
+  if (typeof value === 'string') {
+    if (/^\d{4}-\d{2}-\d{2}T/.test(value)) return 'timestamp with time zone';
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}/.test(value)) return 'uuid';
+    return 'text';
+  }
+  return 'text';
 }
