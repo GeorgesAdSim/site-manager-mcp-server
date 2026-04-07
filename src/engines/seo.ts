@@ -9,6 +9,8 @@
  *   sm_suggest_internal_links — Suggest internal links between same-category documents
  *   sm_auto_fix_seo         — Auto-audit and fix all SEO for a collection in one call
  *   sm_score_global         — Global site score 0-100 aggregating all SEO dimensions
+ *   sm_check_rendering      — Compare HTML rendered meta vs DB meta (SSR injection check)
+ *   sm_generate_canonical   — Generate and persist canonical URLs + hreflang for a collection
  */
 
 import { z } from 'zod';
@@ -1509,6 +1511,423 @@ Returns:
           })),
           trend,
           collections: collectionCounts,
+        };
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
+        };
+      });
+    }
+  );
+
+  // ----------------------------------------------------------
+  // sm_check_rendering
+  // ----------------------------------------------------------
+  server.registerTool(
+    'sm_check_rendering',
+    {
+      title: 'Check SEO Rendering',
+      description: `Compare the HTML rendered by the server vs the SEO data in sm_seo_meta. Detects whether meta tags, JSON-LD schemas, and canonical are properly injected via SSR/Edge Function.
+
+Args:
+  - url: Full URL to check (e.g. "https://jac-machines.media/fr/machines/trancheuses-a-pains-pour-professionnels/duro")
+
+Returns:
+  - title, description, og tags, canonical, JSON-LD found in HTML
+  - Comparison with sm_seo_meta values
+  - Verdict: OK or PROBLEM with details`,
+      inputSchema: {
+        url: z.string().url().describe('Full URL to check'),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ url }) => {
+      return withAudit('sm_check_rendering', 'audit', context.getActiveTargetName(), {
+        params: { url },
+      }, async () => {
+        const contract = await context.loadContract();
+        if (!contract) throw new Error('No Content Contract. Run sm_discover first.');
+
+        const client = context.getClient();
+
+        // 1. Fetch the HTML
+        const response = await fetch(url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; SiteManagerBot/1.0; +https://adsim.be)',
+            'Accept': 'text/html',
+          },
+          redirect: 'follow',
+        });
+
+        if (!response.ok) {
+          throw new Error(`Failed to fetch ${url}: HTTP ${response.status} ${response.statusText}`);
+        }
+
+        const html = await response.text();
+
+        // 2. Parse meta tags from HTML using regex (no DOM parser needed)
+        const extractMeta = (name: string, attr = 'name'): string | null => {
+          const regex = new RegExp(`<meta\\s+${attr}=["']${name}["']\\s+content=["']([^"']*)["']`, 'i');
+          const match = html.match(regex);
+          if (match) return match[1];
+          // Try reversed attribute order
+          const regex2 = new RegExp(`<meta\\s+content=["']([^"']*)["']\\s+${attr}=["']${name}["']`, 'i');
+          const match2 = html.match(regex2);
+          return match2 ? match2[1] : null;
+        };
+
+        const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+        const htmlTitle = titleMatch ? titleMatch[1].trim() : null;
+        const htmlDescription = extractMeta('description');
+        const htmlOgTitle = extractMeta('og:title', 'property');
+        const htmlOgDescription = extractMeta('og:description', 'property');
+        const htmlOgImage = extractMeta('og:image', 'property');
+        const htmlRobots = extractMeta('robots');
+
+        // Canonical
+        const canonicalMatch = html.match(/<link\s+rel=["']canonical["']\s+href=["']([^"']*)["']/i);
+        const htmlCanonical = canonicalMatch ? canonicalMatch[1] : null;
+
+        // JSON-LD scripts
+        const jsonLdRegex = /<script\s+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+        const jsonLdBlocks: { type: string; data: unknown }[] = [];
+        let jsonLdExec;
+        while ((jsonLdExec = jsonLdRegex.exec(html)) !== null) {
+          try {
+            const parsed = JSON.parse(jsonLdExec[1]);
+            jsonLdBlocks.push({
+              type: parsed['@type'] || 'unknown',
+              data: parsed,
+            });
+          } catch {
+            jsonLdBlocks.push({ type: 'parse_error', data: jsonLdExec[1].substring(0, 200) });
+          }
+        }
+
+        // Hreflang tags
+        const hreflangRegex = /<link\s+rel=["']alternate["']\s+hreflang=["']([^"']*)["']\s+href=["']([^"']*)["']/gi;
+        const hreflangs: { lang: string; href: string }[] = [];
+        let hlExec;
+        while ((hlExec = hreflangRegex.exec(html)) !== null) {
+          hreflangs.push({ lang: hlExec[1], href: hlExec[2] });
+        }
+
+        // 3. Try to match the URL to a document in sm_seo_meta
+        // Extract slug from URL: last path segment
+        const urlParts = new URL(url).pathname.split('/').filter(Boolean);
+        const machineSlug = urlParts[urlParts.length - 1] || '';
+        const localeFromUrl = urlParts[0] || 'fr';
+
+        let dbTitle: string | null = null;
+        let dbDescription: string | null = null;
+        let dbCanonical: string | null = null;
+        let dbOgTitle: string | null = null;
+        let dbNoindex = false;
+        let dbFound = false;
+
+        // Find the document by slug across collections
+        for (const [collName, collConfig] of Object.entries(contract.collections)) {
+          const { data: doc } = await client
+            .from(collConfig.table)
+            .select('id')
+            .eq(collConfig.slug_field, machineSlug)
+            .single();
+
+          if (doc) {
+            const docId = (doc as Record<string, unknown>).id as string;
+            const { data: seo } = await client
+              .from('sm_seo_meta')
+              .select('*')
+              .eq('page_type', collName)
+              .eq('page_id', docId)
+              .eq('locale', localeFromUrl)
+              .single();
+
+            if (seo) {
+              const s = seo as Record<string, unknown>;
+              dbTitle = s.meta_title as string | null;
+              dbDescription = s.meta_description as string | null;
+              dbCanonical = s.canonical as string | null;
+              dbOgTitle = s.og_title as string | null;
+              dbNoindex = s.noindex as boolean;
+              dbFound = true;
+            }
+            break;
+          }
+        }
+
+        // 4. Build comparison
+        const titleMatched = dbFound && !!htmlTitle && !!dbTitle && htmlTitle.includes(dbTitle);
+        const descMatched = dbFound && !!htmlDescription && !!dbDescription && htmlDescription === dbDescription;
+
+        const gaps: string[] = [];
+        if (!htmlTitle) gaps.push('No <title> tag found in HTML');
+        if (dbFound && dbTitle && htmlTitle && !titleMatched) gaps.push(`Title mismatch: HTML="${htmlTitle}" vs DB="${dbTitle}"`);
+        if (!htmlDescription) gaps.push('No meta description in HTML');
+        if (dbFound && dbDescription && htmlDescription && !descMatched) gaps.push(`Description mismatch`);
+        if (!htmlCanonical) gaps.push('No canonical tag in HTML');
+        if (!htmlOgTitle && !htmlOgDescription) gaps.push('No Open Graph tags found');
+        if (jsonLdBlocks.length === 0) gaps.push('No JSON-LD structured data found');
+        if (dbFound && dbNoindex && htmlRobots !== 'noindex') gaps.push('DB says noindex but HTML does not enforce it');
+        if (!dbFound) gaps.push(`No SEO meta found in DB for slug "${machineSlug}" locale "${localeFromUrl}"`);
+
+        const verdict = gaps.length === 0
+          ? 'OK — les meta sont correctement injectées'
+          : `PROBLÈME — ${gaps.length} gap(s) entre DB et HTML rendu`;
+
+        const output = {
+          url,
+          http_status: response.status,
+          html_analysis: {
+            title_in_html: htmlTitle,
+            description_in_html: htmlDescription,
+            og_title: htmlOgTitle,
+            og_description: htmlOgDescription,
+            og_image: htmlOgImage,
+            canonical_in_html: htmlCanonical,
+            robots_meta: htmlRobots || 'not set (defaults to index,follow)',
+            jsonld_blocks: jsonLdBlocks.map(b => ({ type: b.type })),
+            jsonld_count: jsonLdBlocks.length,
+            hreflangs,
+          },
+          db_comparison: {
+            db_found: dbFound,
+            title_in_db: dbTitle,
+            title_match: titleMatched,
+            description_in_db: dbDescription,
+            description_match: descMatched,
+            canonical_in_db: dbCanonical,
+            og_title_in_db: dbOgTitle,
+            noindex_in_db: dbNoindex,
+          },
+          gaps,
+          verdict,
+        };
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
+        };
+      });
+    }
+  );
+
+  // ----------------------------------------------------------
+  // sm_generate_canonical
+  // ----------------------------------------------------------
+  server.registerTool(
+    'sm_generate_canonical',
+    {
+      title: 'Generate Canonical URLs',
+      description: `Generate and persist canonical URLs and hreflang alternates for all documents in a collection.
+
+Builds canonical URLs using the pattern: {base_url}/{locale}/machines/{category_slug}/{machine_slug}
+If i18n is enabled, also generates hreflang alternate URLs for each locale.
+
+Args:
+  - collection: Collection name (default "machines")
+  - locale: Primary locale (default "fr")
+  - base_url: Site base URL (default from Content Contract)
+  - limit: Max documents (default 50)
+  - dry_run: If true (default), shows plan without saving
+
+Returns:
+  - documents_processed, canonicals_generated, hreflang alternates`,
+      inputSchema: {
+        collection: z.string().default('machines').describe('Collection name'),
+        locale: z.string().default('fr').describe('Primary locale'),
+        base_url: z.string().optional().describe('Base URL override (defaults to Content Contract site URL)'),
+        limit: z.number().int().min(1).max(200).default(50).describe('Max documents'),
+        dry_run: z.boolean().default(true).describe('If true, do not persist'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ collection, locale, base_url, limit, dry_run }) => {
+      if (!dry_run) {
+        const governance = loadGovernanceConfig();
+        enforceGovernance('sm_generate_canonical', governance);
+      }
+
+      return withAudit('sm_generate_canonical', dry_run ? 'audit' : 'update', context.getActiveTargetName(), {
+        collection,
+        params: { locale, base_url, limit, dry_run },
+      }, async () => {
+        const contract = await context.loadContract();
+        if (!contract) throw new Error('No Content Contract. Run sm_discover first.');
+
+        const config = contract.collections[collection];
+        if (!config) throw new Error(`Collection "${collection}" not found.`);
+
+        const client = context.getClient();
+        const siteUrl = (base_url || contract.site.url).replace(/\/$/, '');
+        const i18nEnabled = contract.i18n?.enabled || false;
+        const locales = contract.i18n?.locales || [locale];
+        const i18nStrategy = contract.i18n?.strategy || 'column';
+        const defaultLocale = contract.i18n?.default_locale || 'fr';
+
+        // 1. Fetch documents
+        const { data: docs, error: docsErr } = await client
+          .from(config.table)
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(limit);
+
+        if (docsErr) throw new Error(`Failed to fetch documents: ${docsErr.message}`);
+        if (!docs || docs.length === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ collection, total: 0, message: 'No documents found.' }, null, 2) }],
+          };
+        }
+
+        // 2. Fetch categories
+        let categoriesData: Record<string, unknown>[] = [];
+        const { data: catData, error: catErr } = await client
+          .from('categories')
+          .select('*');
+        if (!catErr && catData) {
+          categoriesData = catData as Record<string, unknown>[];
+        }
+        const categoryMap = new Map<string, Record<string, unknown>>();
+        for (const cat of categoriesData) {
+          categoryMap.set(cat.id as string, cat);
+        }
+
+        // 3. Fetch existing SEO meta
+        const docIds = (docs as unknown as Record<string, unknown>[]).map(d => d.id as string);
+        const { data: existingSeo } = await client
+          .from('sm_seo_meta')
+          .select('*')
+          .eq('page_type', collection)
+          .eq('locale', locale)
+          .in('page_id', docIds);
+
+        const seoByPageId = new Map<string, Record<string, unknown>>();
+        for (const row of (existingSeo || []) as Record<string, unknown>[]) {
+          seoByPageId.set(row.page_id as string, row);
+        }
+
+        // 4. Generate canonicals and hreflangs
+        const results: {
+          slug: string;
+          name: string;
+          canonical: string;
+          hreflangs: { locale: string; url: string }[];
+          had_canonical: boolean;
+        }[] = [];
+
+        const docRecords = docs as unknown as Record<string, unknown>[];
+
+        for (const machine of docRecords) {
+          const docId = machine.id as string;
+          const machineSlug = (machine[config.slug_field] || '') as string;
+          const machineName = (config.display_field ? machine[config.display_field] : machineSlug) as string;
+          const categoryId = machine.category_id as string | null;
+          const cat = categoryId ? categoryMap.get(categoryId) : null;
+
+          // Resolve category slug for a locale
+          const getCatSlug = (loc: string): string => {
+            if (!cat) return '';
+            if (i18nStrategy === 'suffix' && loc !== defaultLocale) {
+              return (cat[`slug_${loc}`] as string) || (cat.slug as string) || '';
+            }
+            return (cat.slug as string) || '';
+          };
+
+          // Resolve machine slug for a locale
+          const getMachineSlug = (loc: string): string => {
+            if (i18nStrategy === 'suffix' && loc !== defaultLocale) {
+              return (machine[`${config.slug_field}_${loc}`] as string) || machineSlug;
+            }
+            return machineSlug;
+          };
+
+          const canonical = `${siteUrl}/${locale}/machines/${getCatSlug(locale)}/${getMachineSlug(locale)}`;
+
+          // Build hreflang alternates
+          const hreflangs: { locale: string; url: string }[] = [];
+          if (i18nEnabled && locales.length > 1) {
+            for (const loc of locales) {
+              hreflangs.push({
+                locale: loc,
+                url: `${siteUrl}/${loc}/machines/${getCatSlug(loc)}/${getMachineSlug(loc)}`,
+              });
+            }
+            // x-default points to default locale
+            hreflangs.push({
+              locale: 'x-default',
+              url: `${siteUrl}/${defaultLocale}/machines/${getCatSlug(defaultLocale)}/${getMachineSlug(defaultLocale)}`,
+            });
+          }
+
+          const existing = seoByPageId.get(docId);
+          const hadCanonical = !!(existing?.canonical as string | null)?.trim();
+
+          results.push({
+            slug: machineSlug,
+            name: machineName,
+            canonical,
+            hreflangs,
+            had_canonical: hadCanonical,
+          });
+
+          // 5. Persist if not dry_run
+          if (!dry_run) {
+            const hreflangData = hreflangs.length > 0 ? hreflangs : undefined;
+
+            if (existing) {
+              await client
+                .from('sm_seo_meta')
+                .update({
+                  canonical,
+                  ...(hreflangData ? { hreflang: hreflangData } : {}),
+                })
+                .eq('id', existing.id);
+            } else {
+              await client
+                .from('sm_seo_meta')
+                .insert({
+                  page_type: collection,
+                  page_id: docId,
+                  locale,
+                  meta_title: null,
+                  meta_description: null,
+                  focus_keyword: null,
+                  canonical,
+                  og_title: null,
+                  og_description: null,
+                  og_image: null,
+                  noindex: false,
+                  nofollow: false,
+                  seo_score: 0,
+                  score_details: {},
+                  ...(hreflangData ? { hreflang: hreflangData } : {}),
+                });
+            }
+          }
+        }
+
+        const newCanonicals = results.filter(r => !r.had_canonical).length;
+        const totalHreflangs = results.reduce((acc, r) => acc + r.hreflangs.length, 0);
+
+        const output = {
+          collection,
+          locale,
+          base_url: siteUrl,
+          documents_processed: results.length,
+          canonicals_generated: newCanonicals,
+          canonicals_updated: results.length - newCanonicals,
+          hreflang_count: totalHreflangs,
+          i18n_enabled: i18nEnabled,
+          locales_covered: i18nEnabled ? locales : [locale],
+          dry_run,
+          documents: results.map(r => ({
+            slug: r.slug,
+            name: r.name,
+            canonical: r.canonical,
+            hreflangs: r.hreflangs.length > 0 ? r.hreflangs : undefined,
+            was_missing: !r.had_canonical,
+          })),
         };
 
         return {
