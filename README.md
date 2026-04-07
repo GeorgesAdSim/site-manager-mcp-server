@@ -53,7 +53,7 @@ src/
 - **Dual Transport** — stdio for Claude Desktop, HTTP Streamable for web clients
 - **SEO Scoring** — Automated SEO audits with scoring on title, description, keyword presence and placement
 
-## Tools (15)
+## Tools (17)
 
 ### Core Engine
 
@@ -84,6 +84,8 @@ src/
 | `sm_audit_seo` | Bulk SEO audit on a collection with scoring and history |
 | `sm_get_seo_meta` | Read SEO meta for a document (title, description, score) |
 | `sm_update_seo_meta` | Write/update SEO meta with auto score recalculation |
+| `sm_generate_schema` | Generate JSON-LD Product schema (schema.org) for a document |
+| `sm_suggest_internal_links` | Suggest internal links between same-category documents (maillage interne) |
 
 ### SEO Scoring
 
@@ -206,18 +208,20 @@ CREATE TABLE sm_seo_history (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Schema.org structured data
+-- Schema.org structured data (used by sm_generate_schema)
 CREATE TABLE sm_schema_org (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   page_type TEXT NOT NULL,
   page_id UUID NOT NULL,
+  locale TEXT NOT NULL DEFAULT 'fr',
   schema_type TEXT NOT NULL,
   data JSONB NOT NULL,
   validated BOOLEAN DEFAULT false,
-  created_at TIMESTAMPTZ DEFAULT now()
+  created_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(page_type, page_id, locale, schema_type)
 );
 
--- Internal links
+-- Internal links (used by sm_suggest_internal_links)
 CREATE TABLE sm_internal_links (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   source_type TEXT NOT NULL,
@@ -225,7 +229,10 @@ CREATE TABLE sm_internal_links (
   target_type TEXT NOT NULL,
   target_id UUID NOT NULL,
   anchor_text TEXT,
-  approved BOOLEAN DEFAULT false,
+  relevance_score NUMERIC(3,2) DEFAULT 0,
+  auto_generated BOOLEAN DEFAULT false,
+  approved BOOLEAN,
+  batch_id UUID,
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -386,7 +393,7 @@ If `sm_audit_log` table exists, logs are also persisted to Supabase.
 - [ ] **Deploy Engine** — Netlify/Vercel preview + production deploys
 - [ ] **Connect Engine** — Analytics, form submissions, social, webhooks
 - [ ] **i18n Engine** — Translation coverage, sync SEO across locales
-- [ ] **Schema.org Engine** — JSON-LD generation and injection
+- [x] **Schema.org** — JSON-LD Product generation (`sm_generate_schema`) + internal linking suggestions (`sm_suggest_internal_links`)
 - [ ] **Media Engine** — Image optimization, responsive breakpoints
 
 ## License
