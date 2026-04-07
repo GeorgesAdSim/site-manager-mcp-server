@@ -19,7 +19,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that t
 │         (stdio / HTTP Streamable)                │
 ├──────────┬──────────┬──────────┬────────────────┤
 │  Core    │ Content  │   SEO    │  Performance   │
-│ Engine   │ Engine   │ Engine   │   (planned)    │
+│ Engine   │ Engine   │ Engine   │    Engine      │
 ├──────────┴──────────┴──────────┴────────────────┤
 │              Shared Layer                        │
 │   governance.ts · audit.ts · context.ts          │
@@ -40,7 +40,8 @@ src/
   engines/
     core.ts               # Site introspection, discovery, target switching
     content.ts            # CRUD on collections, globals, search
-    seo.ts                # SEO audit, meta read/write, scoring
+    seo.ts                # SEO audit, meta read/write, scoring, schemas, linking
+    performance.ts        # Core Web Vitals, image audit, bundle analysis
 ```
 
 ## Features
@@ -52,8 +53,13 @@ src/
 - **Multi-Site** — Switch between multiple Supabase projects in one session
 - **Dual Transport** — stdio for Claude Desktop, HTTP Streamable for web clients
 - **SEO Scoring** — Automated SEO audits with scoring on title, description, keyword presence and placement
+- **Performance Audits** — Core Web Vitals via PageSpeed Insights, image optimization checks, JS/CSS bundle analysis
+- **Schema.org** — JSON-LD Product generation and validation
+- **Internal Linking** — Automated maillage interne suggestions between same-category documents
+- **Canonical & Hreflang** — Auto-generate canonical URLs and hreflang alternates for all locales
+- **SSR Rendering Check** — Compare HTML-rendered meta vs DB values to detect injection gaps
 
-## Tools (17)
+## Tools (23)
 
 ### Core Engine
 
@@ -86,6 +92,19 @@ src/
 | `sm_update_seo_meta` | Write/update SEO meta with auto score recalculation |
 | `sm_generate_schema` | Generate JSON-LD Product schema (schema.org) for a document |
 | `sm_suggest_internal_links` | Suggest internal links between same-category documents (maillage interne) |
+| `sm_auto_fix_seo` | One-call audit + auto-fix: generates missing titles, descriptions, keywords, canonicals, schemas |
+| `sm_score_global` | Global site score 0-100 aggregating SEO, schema, links, orphans, meta completeness |
+| `sm_check_rendering` | Compare HTML rendered meta vs DB meta — detects SSR/Edge Function injection gaps |
+| `sm_generate_canonical` | Generate and persist canonical URLs + hreflang alternates for all locales |
+| `sm_find_orphan_pages` | Find pages with no inbound internal links (via sm_orphan_pages view) |
+
+### Performance Engine
+
+| Tool | Description |
+|------|-------------|
+| `sm_audit_performance` | Core Web Vitals via Google PageSpeed Insights (LCP, CLS, INP, FCP, TTFB) |
+| `sm_audit_images` | Audit images for format (WebP/AVIF vs legacy), file size, and missing alt text |
+| `sm_audit_bundle` | Analyze JS/CSS bundle sizes from production HTML (script + modulepreload + stylesheet) |
 
 ### SEO Scoring
 
@@ -276,6 +295,17 @@ CREATE TABLE sm_media (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
+-- Orphan pages view (used by sm_find_orphan_pages)
+CREATE VIEW sm_orphan_pages AS
+SELECT s.page_type, s.page_id, s.locale, s.meta_title, s.seo_score
+FROM sm_seo_meta s
+WHERE NOT EXISTS (
+  SELECT 1 FROM sm_internal_links l
+  WHERE l.target_type = s.page_type
+    AND l.target_id = s.page_id
+    AND l.approved = true
+);
+
 -- Redirects
 CREATE TABLE sm_redirects (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -302,7 +332,8 @@ CREATE TABLE sm_redirects (
 | `SM_MAX_CALLS_PER_MINUTE` | No | `0` (unlimited) | Rate limit |
 | `SM_CONTENT_MODE` | No | `supabase` | Content backend |
 | `SM_DEPLOY_TARGET` | No | `netlify` | Deploy provider |
-| `SM_TOOL_CATEGORIES` | No | all | Comma-separated: `core,content,seo` |
+| `SM_TOOL_CATEGORIES` | No | all | Comma-separated: `core,content,seo,performance` |
+| `PAGESPEED_API_KEY` | No | — | Google PageSpeed Insights API key (optional, avoids rate limits) |
 | `MCP_TRANSPORT` | No | `stdio` | Transport: `stdio` or `http` |
 | `MCP_HTTP_PORT` | No | `3100` | HTTP server port |
 | `MCP_AUTH_TOKEN` | No | — | Bearer token for HTTP mode |
@@ -389,11 +420,15 @@ If `sm_audit_log` table exists, logs are also persisted to Supabase.
 
 ## Roadmap
 
-- [ ] **Performance Engine** — Lighthouse audits, bundle analysis, image optimization
+- [x] **Performance Engine** — Core Web Vitals (PageSpeed Insights), image audit, bundle analysis
+- [x] **Schema.org** — JSON-LD Product generation + internal linking + orphan page detection
+- [x] **Canonical & Hreflang** — Auto-generate canonical URLs and hreflang for 10+ locales
+- [x] **SSR Rendering Check** — Compare HTML vs DB meta for injection validation
+- [x] **Auto-Fix SEO** — One-call audit + correction of all SEO gaps
+- [x] **Global Score** — Single 0-100 site score aggregating 5 dimensions
 - [ ] **Deploy Engine** — Netlify/Vercel preview + production deploys
 - [ ] **Connect Engine** — Analytics, form submissions, social, webhooks
 - [ ] **i18n Engine** — Translation coverage, sync SEO across locales
-- [x] **Schema.org** — JSON-LD Product generation (`sm_generate_schema`) + internal linking suggestions (`sm_suggest_internal_links`)
 - [ ] **Media Engine** — Image optimization, responsive breakpoints
 
 ## License
