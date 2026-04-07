@@ -4,6 +4,7 @@
  * Tools:
  *   sm_suggest_keywords   — Propose SEO keywords based on content analysis
  *   sm_growth_priorities  — Top N highest-impact actions to improve the site
+ *   sm_growth_report      — Full site report with score, dimensions, stats, priorities
  */
 
 import { z } from 'zod';
@@ -516,6 +517,250 @@ Returns:
           estimated_score_after: estimatedScore,
           summary,
           priorities,
+        };
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
+        };
+      });
+    }
+  );
+
+  // ----------------------------------------------------------
+  // sm_growth_report
+  // ----------------------------------------------------------
+  server.registerTool(
+    'sm_growth_report',
+    {
+      title: 'Growth Report',
+      description: `Generate a comprehensive site report combining global score, per-collection stats, top growth priorities, and an executive summary.
+
+Args:
+  - locale: Locale (default "fr")
+
+Returns:
+  - Structured report: global score, 5 dimensions, collection stats, top 5 priorities, executive summary, recommendations`,
+      inputSchema: {
+        locale: z.string().default('fr').describe('Locale'),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ locale }) => {
+      return withAudit('sm_growth_report', 'audit', context.getActiveTargetName(), {
+        params: { locale },
+      }, async () => {
+        const contract = await context.loadContract();
+        if (!contract) throw new Error('No Content Contract. Run sm_discover first.');
+
+        const client = context.getClient();
+        const siteUrl = contract.site?.url || process.env.SITE_URL || '';
+        const siteName = contract.site?.name || context.getActiveTargetName();
+
+        // ── 1. Fetch all SEO meta for locale ──
+        const { data: seoData } = await client
+          .from('sm_seo_meta')
+          .select('*')
+          .eq('locale', locale);
+
+        const seoRecords = (seoData || []) as Record<string, unknown>[];
+
+        // ── 2. Score global dimensions (same logic as sm_score_global) ──
+
+        // SEO average
+        const seoScores = seoRecords.map(r => r.seo_score as number);
+        const seoAvg = seoScores.length > 0
+          ? Math.round(seoScores.reduce((a, b) => a + b, 0) / seoScores.length)
+          : 0;
+
+        // Schema coverage
+        const seoPageIds = seoRecords.map(r => r.page_id as string);
+        const { data: schemaData } = await client
+          .from('sm_schema_org')
+          .select('page_id')
+          .in('page_id', seoPageIds.length > 0 ? seoPageIds : ['__none__']);
+
+        const pagesWithSchema = new Set(
+          ((schemaData || []) as Record<string, unknown>[]).map(r => r.page_id as string)
+        );
+        const schemaPct = seoPageIds.length > 0
+          ? Math.round((pagesWithSchema.size / seoPageIds.length) * 100)
+          : 0;
+
+        // Internal links + orphans
+        const { data: linksData } = await client
+          .from('sm_internal_links')
+          .select('target_id, approved')
+          .eq('approved', true);
+
+        const allLinks = (linksData || []) as Record<string, unknown>[];
+        const totalApprovedLinks = allLinks.length;
+        const pagesWithInbound = new Set(allLinks.map(r => r.target_id as string));
+        const orphanPages = seoPageIds.filter(id => !pagesWithInbound.has(id));
+        const orphanPct = seoPageIds.length > 0
+          ? Math.round((orphanPages.length / seoPageIds.length) * 100)
+          : 0;
+        const linksPct = seoPageIds.length > 0
+          ? Math.round((pagesWithInbound.size / seoPageIds.length) * 100)
+          : 0;
+
+        // Meta completeness
+        const withMeta = seoRecords.filter(r =>
+          (r.meta_title as string | null)?.trim() &&
+          (r.meta_description as string | null)?.trim()
+        ).length;
+        const metaPct = seoRecords.length > 0
+          ? Math.round((withMeta / seoRecords.length) * 100)
+          : 0;
+
+        // Global score
+        const globalScore = Math.round(
+          (seoAvg * 0.4) +
+          (schemaPct * 0.2) +
+          (linksPct * 0.15) +
+          ((100 - orphanPct) * 0.1) +
+          (metaPct * 0.15)
+        );
+
+        const dimensions = {
+          seo: { score: seoAvg, weight: 0.4, label: 'SEO Score Average' },
+          schema: { score: schemaPct, weight: 0.2, label: 'Schema.org Coverage' },
+          links: { score: linksPct, weight: 0.15, label: 'Internal Linking' },
+          orphans: { score: 100 - orphanPct, weight: 0.1, label: 'Orphan-Free Rate' },
+          meta: { score: metaPct, weight: 0.15, label: 'Meta Completeness' },
+        };
+
+        // ── 3. Per-collection stats ──
+        const collectionsStats: { name: string; table: string; count: number; seo_avg: number }[] = [];
+
+        for (const [colName, colConfig] of Object.entries(contract.collections)) {
+          const { count: docCount } = await client
+            .from(colConfig.table)
+            .select('*', { count: 'exact', head: true });
+
+          const colSeo = seoRecords.filter(r => r.page_type === colName);
+          const colAvg = colSeo.length > 0
+            ? Math.round(colSeo.reduce((a, r) => a + (r.seo_score as number), 0) / colSeo.length)
+            : 0;
+
+          collectionsStats.push({
+            name: colName,
+            table: colConfig.table,
+            count: docCount || 0,
+            seo_avg: colAvg,
+          });
+        }
+
+        // ── 4. Top 5 growth priorities (inline from sm_growth_priorities logic) ──
+        const { data: historyData } = await client
+          .from('sm_seo_history')
+          .select('avg_score')
+          .eq('locale', locale)
+          .order('audited_at', { ascending: false })
+          .limit(1);
+
+        const lastAvgScore = historyData && historyData.length > 0
+          ? (historyData[0] as Record<string, unknown>).avg_score as number
+          : null;
+
+        const scored: {
+          page_type: string;
+          page_id: string;
+          page_title: string;
+          current_score: number;
+          priority_score: number;
+          issues: string[];
+          action: string;
+          impact: string;
+        }[] = [];
+
+        for (const seo of seoRecords) {
+          const pageId = seo.page_id as string;
+          const pageType = seo.page_type as string;
+          const title = (seo.meta_title as string | null) || '(no title)';
+          const seoScore = seo.seo_score as number;
+          const metaDesc = (seo.meta_description as string | null)?.trim();
+          const focusKw = (seo.focus_keyword as string | null)?.trim();
+
+          let pScore = 0;
+          const issues: string[] = [];
+
+          if (seoScore < 50) { pScore += 40; issues.push(`Low score: ${seoScore}`); }
+          if (!pagesWithSchema.has(pageId)) { pScore += 20; issues.push('No schema'); }
+          if (!pagesWithInbound.has(pageId)) { pScore += 30; issues.push('Orphan'); }
+          if (!metaDesc) { pScore += 25; issues.push('No meta description'); }
+          if (!focusKw) { pScore += 15; issues.push('No focus keyword'); }
+          if (lastAvgScore !== null && seoScore < lastAvgScore - 5) { pScore += 10; issues.push('Score drop'); }
+
+          if (pScore === 0) continue;
+
+          scored.push({
+            page_type: pageType,
+            page_id: pageId,
+            page_title: title,
+            current_score: seoScore,
+            priority_score: pScore,
+            issues,
+            action: seoScore < 50 ? 'sm_auto_fix_seo' : 'sm_update_seo_meta',
+            impact: pScore >= 50 ? 'high' : pScore >= 25 ? 'medium' : 'low',
+          });
+        }
+
+        scored.sort((a, b) => b.priority_score - a.priority_score);
+        const priorities = scored.slice(0, 5).map((p, i) => ({ rank: i + 1, ...p }));
+
+        // ── 5. Executive summary ──
+        const totalDocs = collectionsStats.reduce((a, c) => a + c.count, 0);
+        const highPriorities = priorities.filter(p => p.impact === 'high').length;
+
+        const summaryParts: string[] = [];
+        summaryParts.push(`Site "${siteName}" scores ${globalScore}/100 globally across ${totalDocs} documents in ${collectionsStats.length} collections.`);
+        summaryParts.push(`SEO average is ${seoAvg}/100, meta completeness at ${metaPct}%, schema coverage at ${schemaPct}%.`);
+        if (orphanPages.length > 0) {
+          summaryParts.push(`${orphanPages.length} orphan pages (${orphanPct}%) need internal linking.`);
+        }
+        if (highPriorities > 0) {
+          summaryParts.push(`${highPriorities} high-impact actions identified.`);
+        }
+        if (globalScore >= 80) {
+          summaryParts.push(`Overall health is strong — focus on schema coverage and internal linking to reach 90+.`);
+        } else if (globalScore >= 50) {
+          summaryParts.push(`Good foundation — prioritize fixing missing meta and orphan pages for quick wins.`);
+        } else {
+          summaryParts.push(`Significant improvements needed — run sm_auto_fix_seo and sm_suggest_internal_links as first steps.`);
+        }
+
+        // ── 6. Recommendations ──
+        const recommendations: string[] = [];
+        if (metaPct < 100) recommendations.push(`Complete missing meta (title + description) — currently ${metaPct}% coverage.`);
+        if (schemaPct < 80) recommendations.push(`Generate JSON-LD schemas for uncovered pages — currently ${schemaPct}% coverage.`);
+        if (orphanPages.length > 0) recommendations.push(`Create internal links for ${orphanPages.length} orphan pages via sm_suggest_internal_links.`);
+        if (seoAvg < 70) recommendations.push(`Run sm_auto_fix_seo to batch-correct low-scoring pages.`);
+        if (totalApprovedLinks < totalDocs) recommendations.push(`Strengthen maillage interne — only ${totalApprovedLinks} approved links for ${totalDocs} documents.`);
+        if (recommendations.length === 0) recommendations.push('Site is in excellent shape. Monitor scores and keep content fresh.');
+
+        // ── 7. Build output ──
+        const output = {
+          report_date: new Date().toISOString().split('T')[0],
+          site_name: siteName,
+          site_url: siteUrl,
+          locale,
+          global_score: globalScore,
+          dimensions,
+          collections_stats: collectionsStats,
+          seo_coverage: {
+            total_pages: seoRecords.length,
+            with_complete_meta: withMeta,
+            meta_pct: metaPct,
+            with_schema: pagesWithSchema.size,
+            schema_pct: schemaPct,
+            orphan_pages: orphanPages.length,
+            orphan_pct: orphanPct,
+            approved_links: totalApprovedLinks,
+          },
+          priorities,
+          executive_summary: summaryParts.join(' '),
+          recommendations,
         };
 
         return {
