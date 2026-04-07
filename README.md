@@ -13,20 +13,20 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that t
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   index.ts                       │
-│           Orchestrator + Transport               │
-│         (stdio / HTTP Streamable)                │
-├──────────┬──────────┬──────────┬────────────────┤
-│  Core    │ Content  │   SEO    │  Performance   │
-│ Engine   │ Engine   │ Engine   │    Engine      │
-├──────────┴──────────┴──────────┴────────────────┤
-│              Shared Layer                        │
-│   governance.ts · audit.ts · context.ts          │
-├─────────────────────────────────────────────────┤
-│              Supabase (PostgreSQL)               │
-│   Content tables · sm_* tables · Storage         │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                        index.ts                              │
+│                Orchestrator + Transport                       │
+│              (stdio / HTTP Streamable)                        │
+├──────────┬──────────┬────────┬─────────────┬────────────────┤
+│  Core    │ Content  │  SEO   │ Performance │  Intelligence  │
+│ Engine   │ Engine   │ Engine │   Engine    │    Engine      │
+├──────────┴──────────┴────────┴─────────────┴────────────────┤
+│                      Shared Layer                            │
+│         governance.ts · audit.ts · context.ts                │
+├──────────────────────────────────────────────────────────────┤
+│                   Supabase (PostgreSQL)                       │
+│          Content tables · sm_* tables · Storage               │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ```
@@ -42,6 +42,7 @@ src/
     content.ts            # CRUD on collections, globals, search
     seo.ts                # SEO audit, meta read/write, scoring, schemas, linking
     performance.ts        # Core Web Vitals, image audit, bundle analysis
+    intelligence.ts       # Keyword suggestions, growth priorities, site reports
 ```
 
 ## Features
@@ -58,8 +59,9 @@ src/
 - **Internal Linking** — Automated maillage interne suggestions between same-category documents
 - **Canonical & Hreflang** — Auto-generate canonical URLs and hreflang alternates for all locales
 - **SSR Rendering Check** — Compare HTML-rendered meta vs DB values to detect injection gaps
+- **Intelligence Engine** — TF-based keyword suggestions, growth priorities, and comprehensive site reports with executive summaries
 
-## Tools (23)
+## Tools (26)
 
 ### Core Engine
 
@@ -105,6 +107,14 @@ src/
 | `sm_audit_performance` | Core Web Vitals via Google PageSpeed Insights (LCP, CLS, INP, FCP, TTFB) |
 | `sm_audit_images` | Audit images for format (WebP/AVIF vs legacy), file size, and missing alt text |
 | `sm_audit_bundle` | Analyze JS/CSS bundle sizes from production HTML (script + modulepreload + stylesheet) |
+
+### Intelligence Engine
+
+| Tool | Description |
+|------|-------------|
+| `sm_suggest_keywords` | TF-based keyword extraction with intent classification (transactional/informational) |
+| `sm_growth_priorities` | Top N highest-impact actions ranked by priority score with MCP commands |
+| `sm_growth_report` | Comprehensive site report: global score, 5 dimensions, collection stats, priorities, executive summary |
 
 ### SEO Scoring
 
@@ -426,6 +436,7 @@ If `sm_audit_log` table exists, logs are also persisted to Supabase.
 - [x] **SSR Rendering Check** — Compare HTML vs DB meta for injection validation
 - [x] **Auto-Fix SEO** — One-call audit + correction of all SEO gaps
 - [x] **Global Score** — Single 0-100 site score aggregating 5 dimensions
+- [x] **Intelligence Engine** — Keyword suggestions, growth priorities, full site reports
 - [ ] **Deploy Engine** — Netlify/Vercel preview + production deploys
 - [ ] **Connect Engine** — Analytics, form submissions, social, webhooks
 - [ ] **i18n Engine** — Translation coverage, sync SEO across locales
