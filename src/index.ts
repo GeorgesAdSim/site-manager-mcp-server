@@ -26,8 +26,7 @@ import * as context from './shared/context.js';
 // Engines
 import { registerCoreTools } from './engines/core.js';
 import { registerContentTools } from './engines/content.js';
-// Future engines — uncomment as implemented:
-// import { registerSeoTools } from './engines/seo.js';
+import { registerSeoTools } from './engines/seo.js';
 // import { registerPerformanceTools } from './engines/performance.js';
 // import { registerDeployTools } from './engines/deploy.js';
 // import { registerConnectTools } from './engines/connect.js';
@@ -71,8 +70,8 @@ registerCoreTools(server);
 // Content engine
 registerContentTools(server);
 
-// Future engines:
-// registerSeoTools(server);
+// SEO engine
+registerSeoTools(server);
 // registerPerformanceTools(server);
 // registerDeployTools(server);
 // registerConnectTools(server);
