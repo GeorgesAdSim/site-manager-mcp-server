@@ -19,6 +19,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as context from '../shared/context.js';
 import { withAudit } from '../shared/audit.js';
 import { enforceGovernance, loadGovernanceConfig } from '../shared/governance.js';
+import { getLocalized, isUuid, fetchCategories } from '../shared/helpers.js';
 import type { SeoCheck } from '../types.js';
 
 // ============================================================
@@ -332,10 +333,10 @@ Returns:
         const client = context.getClient();
 
         // Resolve slug to UUID if needed
-        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+        const idIsUuid = isUuid(id);
         let pageId = id;
 
-        if (!isUuid) {
+        if (!idIsUuid) {
           const { data: doc, error } = await client
             .from(config.table)
             .select('id')
@@ -445,10 +446,10 @@ Returns:
         const client = context.getClient();
 
         // Resolve slug to UUID
-        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+        const idIsUuid = isUuid(id);
         let pageId = id;
 
-        if (!isUuid) {
+        if (!idIsUuid) {
           const { data: doc, error } = await client
             .from(config.table)
             .select('id')
@@ -583,9 +584,9 @@ Returns:
         const client = context.getClient();
 
         // 1. Fetch the document
-        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+        const idIsUuid = isUuid(id);
         let query = client.from(config.table).select('*');
-        if (isUuid) {
+        if (idIsUuid) {
           query = query.eq('id', id);
         } else {
           query = query.eq(config.slug_field, id);
@@ -597,27 +598,13 @@ Returns:
         const machine = doc as Record<string, unknown>;
         const machineId = machine.id as string;
 
-        // Resolve localized fields (suffix i18n strategy: name_fr, description_fr, etc.)
+        // Resolve localized fields via shared helper
         const i18nStrategy = contract.i18n?.strategy || 'column';
         const defaultLocale = contract.i18n?.default_locale || 'fr';
         const isDefault = locale === defaultLocale;
 
-        function getLocalizedField(base: string): string | null {
-          if (i18nStrategy === 'suffix' && !isDefault) {
-            const localized = machine[`${base}_${locale}`];
-            if (localized) return String(localized);
-          }
-          // Fallback: base field or base_defaultLocale
-          if (machine[base] != null) return String(machine[base]);
-          if (i18nStrategy === 'suffix') {
-            const fallback = machine[`${base}_${defaultLocale}`];
-            if (fallback) return String(fallback);
-          }
-          return null;
-        }
-
-        const name = getLocalizedField('name') || getLocalizedField('title') || (machine[config.display_field || 'name'] as string) || '';
-        const description = getLocalizedField('description') || getLocalizedField('subtitle') || '';
+        const name = getLocalized(machine, 'name', locale, contract) || getLocalized(machine, 'title', locale, contract) || (machine[config.display_field || 'name'] as string) || '';
+        const description = getLocalized(machine, 'description', locale, contract) || getLocalized(machine, 'subtitle', locale, contract) || '';
         const thumbnailUrl = (machine.thumbnail_url || machine.image_url || machine.og_image || '') as string;
         const machineSlug = (machine[config.slug_field] || machine.slug || '') as string;
 
@@ -789,26 +776,8 @@ Returns:
           };
         }
 
-        // 2. Fetch all categories for name resolution
-        // Try with parent_id first, fallback without it
-        let categoriesData: Record<string, unknown>[] | null = null;
-        const { data: catWithParent, error: catErr1 } = await client
-          .from('categories')
-          .select('id, name, slug, parent_id');
-        if (catErr1) {
-          // parent_id column might not exist
-          const { data: catWithout } = await client
-            .from('categories')
-            .select('id, name, slug');
-          categoriesData = (catWithout || []) as Record<string, unknown>[];
-        } else {
-          categoriesData = (catWithParent || []) as Record<string, unknown>[];
-        }
-
-        const categoryMap = new Map<string, Record<string, unknown>>();
-        for (const cat of categoriesData) {
-          categoryMap.set(cat.id as string, cat);
-        }
+        // 2. Fetch all categories (cached, with parent_id fallback)
+        const categoryMap = await fetchCategories(client);
 
         // 3. Group documents by category_id
         const byCategory = new Map<string, Record<string, unknown>[]>();
@@ -1056,32 +1025,8 @@ Returns:
           schemaSet.add(`${row.page_id}:${row.schema_type}`);
         }
 
-        // 4. Fetch categories
-        let categoriesData: Record<string, unknown>[] = [];
-        const { data: catData, error: catErr } = await client
-          .from('categories')
-          .select('id, name, slug');
-        if (!catErr && catData) {
-          categoriesData = catData as Record<string, unknown>[];
-        }
-        const categoryMap = new Map<string, Record<string, unknown>>();
-        for (const cat of categoriesData) {
-          categoryMap.set(cat.id as string, cat);
-        }
-
-        // Helper: get localized field
-        function getLocalized(machine: Record<string, unknown>, base: string): string | null {
-          if (i18nStrategy === 'suffix' && !isDefault) {
-            const localized = machine[`${base}_${locale}`];
-            if (localized) return String(localized);
-          }
-          if (machine[base] != null) return String(machine[base]);
-          if (i18nStrategy === 'suffix') {
-            const fallback = machine[`${base}_${defaultLocale}`];
-            if (fallback) return String(fallback);
-          }
-          return null;
-        }
+        // 4. Fetch categories (cached)
+        const categoryMap = await fetchCategories(client);
 
         // 5. Build fix plan for each document
         const actions: {
@@ -1105,10 +1050,10 @@ Returns:
           const docId = machine.id as string;
           const existing = seoByPageId.get(docId);
           const machineSlug = (machine[config.slug_field] || machine.slug || '') as string;
-          const machineName = getLocalized(machine, 'name') || getLocalized(machine, 'title') ||
+          const machineName = getLocalized(machine, 'name', locale, contract) || getLocalized(machine, 'title', locale, contract) ||
             (config.display_field ? machine[config.display_field] as string : machineSlug) || '';
-          const machineSubtitle = getLocalized(machine, 'subtitle') || '';
-          const machineDesc = getLocalized(machine, 'description') || '';
+          const machineSubtitle = getLocalized(machine, 'subtitle', locale, contract) || '';
+          const machineDesc = getLocalized(machine, 'description', locale, contract) || '';
           const categoryId = machine.category_id as string | null;
           const cat = categoryId ? categoryMap.get(categoryId) : null;
           const catName = cat ? (cat.name as string) : '';

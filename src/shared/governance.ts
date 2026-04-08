@@ -35,6 +35,8 @@ const READ_ONLY_TOOLS = new Set([
   'sm_get_navigation',
   'sm_get_seo_meta', 'sm_audit_seo', 'sm_check_rendering', 'sm_audit_links',
   'sm_suggest_internal_links', 'sm_seo_report',
+  'sm_suggest_keywords', 'sm_growth_priorities', 'sm_growth_report',
+  'sm_translation_coverage', 'sm_missing_translations',
   'sm_audit_performance', 'sm_audit_bundle', 'sm_audit_images',
   'sm_check_headers', 'sm_performance_report',
   'sm_deploy_status',
@@ -90,6 +92,7 @@ const TOOL_CATEGORIES: Record<string, string[]> = {
     'sm_list_collections', 'sm_list_documents', 'sm_get_document',
     'sm_create_document', 'sm_update_document', 'sm_delete_document',
     'sm_update_global', 'sm_search', 'sm_get_navigation', 'sm_update_navigation',
+    'sm_batch_update',
   ],
   seo: [
     'sm_get_seo_meta', 'sm_update_seo_meta', 'sm_audit_seo',
@@ -108,9 +111,11 @@ const TOOL_CATEGORIES: Record<string, string[]> = {
     'sm_get_analytics', 'sm_list_form_submissions', 'sm_generate_social_post',
     'sm_sync_business_profile', 'sm_manage_webhooks',
   ],
+  intelligence: [
+    'sm_suggest_keywords', 'sm_growth_priorities', 'sm_growth_report',
+  ],
   i18n: [
-    'sm_list_languages', 'sm_audit_translation_coverage',
-    'sm_get_translations', 'sm_sync_seo_translations',
+    'sm_translation_coverage', 'sm_missing_translations', 'sm_sync_seo_locales',
   ],
   governance: ['sm_changelog', 'sm_audit_log_query'],
 };

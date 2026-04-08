@@ -11,6 +11,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as context from '../shared/context.js';
 import { withAudit } from '../shared/audit.js';
+import { getLocalized, isUuid, fetchCategories } from '../shared/helpers.js';
 
 // ============================================================
 // French stop words
@@ -121,15 +122,11 @@ Returns:
         if (!config) throw new Error(`Collection "${collection}" not found.`);
 
         const client = context.getClient();
-        const i18nStrategy = contract.i18n?.strategy || 'column';
-        const defaultLocale = contract.i18n?.default_locale || 'fr';
-        const isDefault = locale === defaultLocale;
 
         // 1. Fetch document(s)
         let query = client.from(config.table).select('*');
         if (id) {
-          const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-          query = isUuid ? query.eq('id', id) : query.eq(config.slug_field, id);
+          query = isUuid(id) ? query.eq('id', id) : query.eq(config.slug_field, id);
         } else {
           query = query.order('created_at', { ascending: false }).limit(limit);
         }
@@ -137,12 +134,8 @@ Returns:
         const { data: docs, error: docsErr } = id ? await query.single().then(r => ({ data: r.data ? [r.data] : null, error: r.error })) : await query;
         if (docsErr || !docs || docs.length === 0) throw new Error(`No documents found.`);
 
-        // 2. Fetch categories
-        const { data: catData } = await client.from('categories').select('id, name, slug');
-        const categoryMap = new Map<string, Record<string, unknown>>();
-        for (const cat of (catData || []) as Record<string, unknown>[]) {
-          categoryMap.set(cat.id as string, cat);
-        }
+        // 2. Fetch categories (cached)
+        const categoryMap = await fetchCategories(client);
 
         // 3. Fetch existing SEO meta
         const docIds = (docs as unknown as Record<string, unknown>[]).map(d => d.id as string);
@@ -156,20 +149,6 @@ Returns:
         const focusByPageId = new Map<string, string | null>();
         for (const row of (seoData || []) as Record<string, unknown>[]) {
           focusByPageId.set(row.page_id as string, (row.focus_keyword as string | null) || null);
-        }
-
-        // Helper: localized field
-        function getLocalized(machine: Record<string, unknown>, base: string): string {
-          if (i18nStrategy === 'suffix' && !isDefault) {
-            const v = machine[`${base}_${locale}`];
-            if (v) return String(v);
-          }
-          if (machine[base] != null) return String(machine[base]);
-          if (i18nStrategy === 'suffix') {
-            const v = machine[`${base}_${defaultLocale}`];
-            if (v) return String(v);
-          }
-          return '';
         }
 
         // 4. Analyze each document
@@ -191,10 +170,10 @@ Returns:
         for (const doc of docs as unknown as Record<string, unknown>[]) {
           const docId = doc.id as string;
           const machineSlug = (doc[config.slug_field] || '') as string;
-          const machineName = getLocalized(doc, 'name') || getLocalized(doc, 'title') ||
+          const machineName = getLocalized(doc, 'name', locale, contract) || getLocalized(doc, 'title', locale, contract) ||
             (config.display_field ? doc[config.display_field] as string : machineSlug);
-          const machineDesc = getLocalized(doc, 'description') || '';
-          const machineSubtitle = getLocalized(doc, 'subtitle') || '';
+          const machineDesc = getLocalized(doc, 'description', locale, contract) || '';
+          const machineSubtitle = getLocalized(doc, 'subtitle', locale, contract) || '';
           const catId = doc.category_id as string | null;
           const cat = catId ? categoryMap.get(catId) : null;
           const catName = cat ? (cat.name as string) : '';

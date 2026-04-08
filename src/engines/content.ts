@@ -17,6 +17,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as context from '../shared/context.js';
 import { withAudit } from '../shared/audit.js';
 import { enforceGovernance, loadGovernanceConfig } from '../shared/governance.js';
+import { isUuid } from '../shared/helpers.js';
 
 export function registerContentTools(server: McpServer): void {
 
@@ -204,9 +205,9 @@ Args:
 
         // Try by UUID first, then by slug
         let query = client.from(config.table).select('*');
-        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-        
-        if (isUuid) {
+        const idIsUuid = isUuid(id);
+
+        if (idIsUuid) {
           query = query.eq('id', id);
         } else {
           query = query.eq(config.slug_field, id);
@@ -374,8 +375,8 @@ Returns:
         if (!config) throw new Error(`Collection "${collection}" not found.`);
 
         const client = context.getClient();
-        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-        const filterField = isUuid ? 'id' : config.slug_field;
+        const idIsUuid = isUuid(id);
+        const filterField = idIsUuid ? 'id' : config.slug_field;
 
         const { data: updated, error } = await client
           .from(config.table)
@@ -427,8 +428,8 @@ Args:
         if (!config) throw new Error(`Collection "${collection}" not found.`);
 
         const client = context.getClient();
-        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-        const filterField = isUuid ? 'id' : config.slug_field;
+        const idIsUuid = isUuid(id);
+        const filterField = idIsUuid ? 'id' : config.slug_field;
 
         const { error } = await client
           .from(config.table)
@@ -438,7 +439,7 @@ Args:
         if (error) throw new Error(`Delete failed: ${error.message}`);
 
         // Also clean up SEO meta, schemas, and links
-        const docId = isUuid ? id : undefined;
+        const docId = idIsUuid ? id : undefined;
         if (docId) {
           await client.from('sm_seo_meta').delete().eq('page_type', collection).eq('page_id', docId);
           await client.from('sm_schema_org').delete().eq('page_type', collection).eq('page_id', docId);
@@ -572,6 +573,104 @@ Returns:
         }
 
         const output = { query, results, total_found: totalFound };
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
+        };
+      });
+    }
+  );
+
+  // ----------------------------------------------------------
+  // sm_batch_update
+  // ----------------------------------------------------------
+  server.registerTool(
+    'sm_batch_update',
+    {
+      title: 'Batch Update Documents',
+      description: `Execute multiple document updates in one call. Each operation specifies a collection, document ID/slug, and data to update.
+
+Args:
+  - operations: Array of {collection, id, data} objects
+
+Returns:
+  - Total operations, successes, errors, per-operation detail`,
+      inputSchema: {
+        operations: z.array(z.object({
+          collection: z.string().min(1).describe('Collection name'),
+          id: z.string().min(1).describe('Document UUID or slug'),
+          data: z.record(z.unknown()).describe('Fields to update'),
+        })).min(1).max(50).describe('Array of update operations (max 50)'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ operations }) => {
+      const governance = loadGovernanceConfig();
+      enforceGovernance('sm_batch_update', governance);
+
+      return withAudit('sm_batch_update', 'update', context.getActiveTargetName(), {
+        params: { operation_count: operations.length },
+      }, async () => {
+        const contract = await context.loadContract();
+        if (!contract) throw new Error('No Content Contract. Run sm_discover first.');
+
+        const client = context.getClient();
+
+        const results: {
+          index: number;
+          collection: string;
+          id: string;
+          status: 'success' | 'error';
+          fields_updated?: string[];
+          error?: string;
+        }[] = [];
+
+        let successCount = 0;
+        let errorCount = 0;
+
+        for (let i = 0; i < operations.length; i++) {
+          const op = operations[i];
+          try {
+            const config = contract.collections[op.collection];
+            if (!config) throw new Error(`Collection "${op.collection}" not found.`);
+
+            const idIsUuid2 = isUuid(op.id);
+            const filterField = idIsUuid2 ? 'id' : config.slug_field;
+
+            const { error } = await client
+              .from(config.table)
+              .update(op.data)
+              .eq(filterField, op.id);
+
+            if (error) throw new Error(error.message);
+
+            results.push({
+              index: i,
+              collection: op.collection,
+              id: op.id,
+              status: 'success',
+              fields_updated: Object.keys(op.data),
+            });
+            successCount++;
+          } catch (err) {
+            results.push({
+              index: i,
+              collection: op.collection,
+              id: op.id,
+              status: 'error',
+              error: err instanceof Error ? err.message : String(err),
+            });
+            errorCount++;
+          }
+        }
+
+        const output = {
+          total_operations: operations.length,
+          success: successCount,
+          errors: errorCount,
+          results,
+        };
+
         return {
           content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
           structuredContent: output,

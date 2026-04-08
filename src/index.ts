@@ -29,9 +29,9 @@ import { registerContentTools } from './engines/content.js';
 import { registerSeoTools } from './engines/seo.js';
 import { registerPerformanceTools } from './engines/performance.js';
 import { registerIntelligenceTools } from './engines/intelligence.js';
+import { registerI18nTools } from './engines/i18n.js';
 // import { registerDeployTools } from './engines/deploy.js';
 // import { registerConnectTools } from './engines/connect.js';
-// import { registerI18nTools } from './engines/i18n.js';
 
 // ============================================================
 // Constants
@@ -79,9 +79,9 @@ registerPerformanceTools(server);
 
 // Intelligence engine
 registerIntelligenceTools(server);
+registerI18nTools(server);
 // registerDeployTools(server);
 // registerConnectTools(server);
-// registerI18nTools(server);
 
 // ============================================================
 // Health check endpoint (HTTP mode only)
